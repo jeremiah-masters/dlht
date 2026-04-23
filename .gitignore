@@ -1,0 +1,21 @@
+# IDE
+.idea/
+
+# Mac
+.DS_Store
+
+# build
+output/
+bin/
+
+*.log*
+tests/**/*.html
+
+.ftt
+
+coverage.out
+coverage.html
+
+.worktrees/
+.tlacache/
+states/
