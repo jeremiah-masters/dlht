@@ -217,6 +217,7 @@ func makePrimaryAlignedSlice[K Key, V any](n uint64) []PrimaryBucket[K, V] {
 			alignedPtr := unsafe.Add(unsafe.Pointer(unsafe.SliceData(buf)), alignedPadding)
 			return unsafe.Slice((*PrimaryBucket[K, V])(alignedPtr), n)
 		}
+		// TODO - add additional alignments, at the moment other offsets will fallback to heap allocation
 	}
 	// Fallback - allocate large buffer to heap allocation to ensure alignment,
 	// can handle additional offsets as a later improvement instead of this
@@ -239,6 +240,7 @@ func makeLinkAlignedSlice[K Key, V any](n uint64) []LinkBucket[K, V] {
 			alignedPtr := unsafe.Add(unsafe.Pointer(unsafe.SliceData(buf)), alignedPadding)
 			return unsafe.Slice((*LinkBucket[K, V])(alignedPtr), n)
 		}
+		// TODO - add additional alignments, at the moment other offsets will fallback to heap allocation
 	}
 	return make([]LinkBucket[K, V], max(n, LargeBufferSize))[:n:n]
 }
