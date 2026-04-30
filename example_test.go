@@ -13,9 +13,14 @@ func Example() {
 	m := dlht.New[string, int](dlht.Options{InitialSize: 64})
 
 	// Insert key-value pairs
-	_, _ = m.Insert("apple", 5)
-	_, _ = m.Insert("banana", 3)
-	_, _ = m.Insert("cherry", 8)
+	m.Insert("apple", 5)
+	m.Insert("banana", 3)
+
+	if oldValue, inserted := m.Insert("cherry", 8); inserted {
+		fmt.Println("Inserted cherry")
+	} else {
+		fmt.Printf("Cherry already existed with value: %d\n", oldValue)
+	}
 
 	// Get values
 	if value, found := m.Get("apple"); found {
@@ -33,8 +38,8 @@ func Example() {
 	}
 
 	// Delete a key
-	if _, deleted := m.Delete("banana"); deleted {
-		fmt.Println("Deleted banana")
+	if oldValue, deleted := m.Delete("banana"); deleted {
+		fmt.Printf("Deleted banana (old value: %d)\n", oldValue)
 	}
 
 	// Print statistics
@@ -42,10 +47,11 @@ func Example() {
 	fmt.Printf("Map has %d bins with load factor %.3f\n", stats.NumBins, stats.LoadFactor)
 
 	// Output:
+	// Inserted cherry
 	// Found: apple = 5
 	// Updated apple: 5 -> 10
 	// Current value: apple = 10
-	// Deleted banana
+	// Deleted banana (old value: 3)
 	// Map has 64 bins with load factor 0.010
 }
 
@@ -58,16 +64,16 @@ func Example_concurrent() {
 	itemsPerWorker := 10
 
 	// Concurrent inserts
-	for i := 0; i < numWorkers; i++ {
+	for workerID := range numWorkers {
 		wg.Add(1)
-		go func(workerID int) {
+		go func() {
 			defer wg.Done()
-			for j := 0; j < itemsPerWorker; j++ {
+			for j := range itemsPerWorker {
 				key := uint64(workerID*itemsPerWorker + j)
 				value := fmt.Sprintf("worker-%d-item-%d", workerID, j)
 				_, _ = m.Insert(key, value)
 			}
-		}(i)
+		}()
 	}
 
 	wg.Wait()
@@ -75,7 +81,7 @@ func Example_concurrent() {
 	// Verify all items were inserted
 	totalItems := numWorkers * itemsPerWorker
 	foundItems := 0
-	for i := 0; i < totalItems; i++ {
+	for i := range totalItems {
 		if _, found := m.Get(uint64(i)); found {
 			foundItems++
 		}

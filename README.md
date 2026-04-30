@@ -29,18 +29,18 @@ func main() {
     m.Insert("banana", 3)
 
     // Get values
-    if entry, found := m.Get("apple"); found {
-        fmt.Printf("Found: %s = %d\n", entry.Key, entry.Value)
+    if value, found := m.Get("apple"); found {
+        fmt.Printf("Found: apple = %d\n", value)
     }
 
     // Update values atomically
-    if oldEntry, updated := m.Put("apple", 10); updated {
-        fmt.Printf("Updated %s: %d -> %d\n", oldEntry.Key, oldEntry.Value, 10)
+    if oldValue, updated := m.Put("apple", 10); updated {
+        fmt.Printf("Updated apple: %d -> %d\n", oldValue, 10)
     }
 
     // Delete keys
-    if deleted := m.Delete("banana"); deleted {
-        fmt.Println("Deleted banana")
+    if oldValue, deleted := m.Delete("banana"); deleted {
+        fmt.Printf("Deleted banana (old value: %d)\n", oldValue)
     }
 
     // Get statistics
@@ -62,10 +62,10 @@ func main() {
 ### Functions
 
 - `New[K Key, V any](opts Options) *Map[K, V]`: Create a new DLHT
-- `(m *Map[K, V]) Get(key K) (*Entry[K, V], bool)`: Get a value by key
-- `(m *Map[K, V]) Insert(key K, value V) bool`: Insert a new key-value pair
-- `(m *Map[K, V]) Put(key K, value V) (*Entry[K, V], bool)`: Update an existing key atomically
-- `(m *Map[K, V]) Delete(key K) bool`: Delete a key
+- `(m *Map[K, V]) Get(key K) (V, bool)`: Get a value by key
+- `(m *Map[K, V]) Insert(key K, value V) (V, bool)`: Insert a new key-value pair
+- `(m *Map[K, V]) Put(key K, value V) (V, bool)`: Update an existing key atomically
+- `(m *Map[K, V]) Delete(key K) (V, bool)`: Delete a key and return the old value
 - `(m *Map[K, V]) Stats() Stats`: Get current statistics
 
 ## Implementation Details

@@ -15,18 +15,18 @@
 //	m.Insert("key2", 100)
 //
 //	// Get values
-//	if entry, found := m.Get("key1"); found {
-//		fmt.Printf("Found: %s = %d\n", entry.Key, entry.Value)
+//	if value, found := m.Get("key1"); found {
+//		fmt.Printf("Found: key1 = %d\n", value)
 //	}
 //
 //	// Update values atomically
-//	if oldEntry, updated := m.Put("key1", 84); updated {
-//		fmt.Printf("Updated %s: %d -> %d\n", oldEntry.Key, oldEntry.Value, 84)
+//	if oldValue, updated := m.Put("key1", 84); updated {
+//		fmt.Printf("Updated key1: %d -> %d\n", oldValue, 84)
 //	}
 //
 //	// Delete keys
-//	if deleted := m.Delete("key2"); deleted {
-//		fmt.Println("Deleted key2")
+//	if oldValue, deleted := m.Delete("key2"); deleted {
+//		fmt.Printf("Deleted key2 (old value: %d)\n", oldValue)
 //	}
 package dlht
 
@@ -43,7 +43,7 @@ type Options = allocator.Options
 
 type Stats = allocator.Stats
 
-// New creates a new DLHT with the specified options.
+// New creates a new Map[K, V] with the specified options.
 //
 // If opts.InitialSize is 0, it defaults to 16.
 // The actual initial size will be rounded up to the next power of 2.
