@@ -4,7 +4,7 @@
 
 DLHT implements a lock-free concurrent hash table based on the DLHT algorithm from HPDC'24. This document explains not just *what* the implementation does, but *why* each design decision was made and how the pieces fit together to achieve correctness under arbitrary concurrency.
 
-The fundamental challenge of concurrent hash tables is allowing multiple threads to read and write simultaneously without corrupting data or losing updates. Traditional approaches use locks, which serialize access and limit scalability. DLHT instead uses atomic operations and careful memory ordering to achieve lock-freedom: any thread can make progress regardless of what other threads are doing.
+The fundamental challenge of concurrent hash tables is allowing multiple threads to read and write simultaneously without corrupting data or losing updates. Traditional approaches use locks, which serialize access and limit scalability. DLHT instead uses atomic operations and careful memory ordering to achieve lock-freedom: no thread holds a lock that could block others, so the system as a whole always makes progress—even though an individual operation may retry under contention while other threads succeed.
 
 ---
 
@@ -47,7 +47,7 @@ type index[K Key, V any] struct {
 }
 ```
 
-The padding between `active`/`hashConfig` and `resizeCtx` isn't wasted space—it ensures these two groups of fields live on different CPU cache lines. Without this padding, a thread modifying `resizeCtx` during resize would invalidate the cache line containing `active`, forcing all other threads to re-fetch it from main memory. This "false sharing" can devastate performance on multi-core systems. The padding is sized via `cpu.CacheLineSize` so it adapts per platform: 48 bytes on amd64 (64-byte cache lines) and 112 bytes on arm64 (128-byte cache lines—Apple M-series and most modern ARM servers).
+The padding between `active`/`hashConfig` and `resizeCtx` isn't wasted space—it ensures these two groups of fields live on different CPU cache lines. Without this padding, a thread modifying `resizeCtx` during resize would invalidate the cache line containing `active` on every other core, forcing each reader to refetch through the cache coherence protocol—usually a snoop from a peer core's cache, sometimes from L2 or L3, occasionally all the way from main memory. This "false sharing" can devastate performance on multi-core systems. The padding is sized via `cpu.CacheLineSize` so it adapts per platform: 48 bytes on amd64 (64-byte cache lines) and 112 bytes on arm64 (128-byte cache lines—Apple M-series and most modern ARM servers).
 
 The Index holds a `mask` field that's always one less than the number of bins (which is always a power of two). This allows computing `binIndex = hash & mask` instead of the much slower `hash % numBins`. A single AND instruction replaces division.
 
@@ -390,14 +390,14 @@ Having chosen an Invalid slot, we attempt to claim it with a CAS that transition
 │ Ver | BinState | SlotState  │  PairStart  |  Single   | Key | Value | Key | Value | Key | Value │
 │(32b)|   (2b)   |   (30b)    │    (32b)    │  (32b)    │(64b)| (64b) │(64b)| (64b) │(64b)| (64b) │
 ├─────┼──────────┼────────────┼─────────────┼───────────┼─────┼───────┼─────┼───────┼─────┼───────┤
-│ 43  │    00    │  S2 S1 S0  │      00     │     00    │ --- │ ---   │ K1  │  V1   │ K2  │  V2   │
+│ 43  │    00    │  S2 S1 S0  │      00     │     00    │ --- │  ---  │ K1  │  V1   │ K2  │  V2   │
 │     │NoTransfer│  10 10 01  │   NO_LINK   │  NO_LINK  │     │       │     │       │     │       │
 └─────┴──────────┴────────────┴─────────────┴───────────┴─────┴───────┴─────┴───────┴─────┴───────┘
   ▲                       ▲
   Version: 42 → 43       Changed: 00 → 01 (Invalid → Trying)
 ```
 
-The CAS compares the entire 64-bit header. If any bit changed since we read it—another thread reserved a slot, attached a link, deleted an entry, or started transfer—the CAS fails and we retry from the beginning.
+The CAS compares the entire 64-bit header. If any bit changed since we read it—another thread reserved or unreserved a slot, completed a delete, or started transfer—the CAS fails and we retry from the beginning. Link attachment changes `LinkMeta`, not the header, so it does not by itself fail the reserve CAS; concurrent attachers race on `LinkMeta` separately.
 
 If the CAS succeeds, we own the slot exclusively. No other thread can claim it (it's not Invalid), readers can't see it (it's not Valid), and transfer will skip it (only Valid slots transfer). We can safely write to the slot.
 

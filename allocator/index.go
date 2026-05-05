@@ -8,10 +8,32 @@ import (
 )
 
 const (
-	// Number of bins requred to force mallocgc to allocate directly from the heap
+	// mallocgc prepends an 8-byte type pointer to scan allocations whose size
+	// falls in (minSizeForMallocHeader, maxSmallSize-mallocHeaderSize]. Smaller
+	// allocations keep their pointer bits in the span bitmap; larger ones go
+	// through the large-object path on a page-aligned span. See
+	// internal/runtime/gc in the Go tree.
+	// https://github.com/golang/go/blob/go1.25.3/src/internal/runtime/gc/sizeclasses.go#L86
+	minSizeForMallocHeader = 512
+	mallocHeaderSize       = 8
+	maxSmallSize           = 32 * 1024
+	bucketByteSize         = 64
+
+	// Smallest bucket count whose byte size overflows mallocgc's headered-small
+	// ceiling, forcing the allocation onto the page-aligned large-object path.
 	// https://github.com/golang/go/blob/go1.25.3/src/runtime/malloc.go#L998
-	LargeBufferSize = 512
+	largeBufferSize = (maxSmallSize-mallocHeaderSize)/bucketByteSize + 1 // = 512
 )
+
+// mallocgcAddsHeader reports whether a (n+2)-bucket allocation will get the
+// 8-byte malloc header. With the header, user data lands at addr%64 == 8 and
+// we need the rotated layout. Without it, addr%64 == 0 and the natural layout
+// is fine. The byte-size check is enough to decide because every size class
+// in the header range has elemsize divisible by 64.
+func mallocgcAddsHeader(n uint64) bool {
+	total := (n + 2) * bucketByteSize
+	return total > minSizeForMallocHeader && total+mallocHeaderSize <= maxSmallSize
+}
 
 func newIndex[K Key, V any](numBins uint64) *index[K, V] {
 	return &index[K, V]{
@@ -151,9 +173,9 @@ type LinkBucketRot8[K Key, V any] struct {
 // 0         8         16                32                48               64
 //
 // Unaligned allocation (8-byte offset from cache line boundary):
-// Cache Line:  ┌─────────────────────────────────────────────────────────┐
-// Allocation:  │   ┌────────┬──────────┬─────────────────────────────────────┐
-//              └── │ Header │ LinkMeta │              Slots[3]               │
+// Cache Line:  ┌────────┬──────────┬─────────────────────────────────────┐
+// Allocation:  │  H┌────┴───┬──────┴───┬─────────────────────────────────┴───┐
+//              └── ┤ Header │ LinkMeta │              Slots[3]               │
 //                  └────────┴──────────┴─────────────────────────────────────┘
 //                  8        16        24                                64  72
 // If we use unsafe to start from next cache line boundary (64), we'd be starting
@@ -176,9 +198,9 @@ type LinkBucketRot8[K Key, V any] struct {
 //
 // To solve this, we use PrimaryBucketRot8 with rotated field layout:
 //
-// Cache Line:  ┌────────────────────────────────────────────────────┐
-// Allocation:  │   ┌──────────┬─────────────────────────────────────┬────────┐
-//              └── │ LinkMeta │              Slots[3]               │ Header │
+// Cache Line:  ┌──────────┬─────────────────────────────────────┬───────┐
+// Allocation:  │  H┌──────┴───┬─────────────────────────────────┴───┬───┴────┐
+//              └── ┤ LinkMeta │              Slots[3]               │ Header │
 //                  └──────────┴─────────────────────────────────────┴────────┘
 //                  8        16        24                            64      72
 //
@@ -200,47 +222,51 @@ type LinkBucketRot8[K Key, V any] struct {
 // The pointers located in the Slots are now at the same relative positions the GC expects
 // for a normal PrimaryBucket, ensuring proper garbage collection tracking.
 func makePrimaryAlignedSlice[K Key, V any](n uint64) []PrimaryBucket[K, V] {
-	// Add 2 extra buckets (both bucket types are 64 bytes) since ARM cache line size can be 128 bytes
-	// Although it's not needed for the aligned base-case, we maintain consistency with the slice
-	// sizes to avoid the slice promoting to a larger size class
-	buf := make([]PrimaryBucket[K, V], n+2)
-	offset := uintptr(unsafe.Pointer(unsafe.SliceData(buf))) & (cpu.CacheLineSize - 1)
-	switch offset {
-	case 0:
-		return buf[:n:n]
-	case 8:
-		buf := make([]PrimaryBucketRot8[K, V], n+2)
-		offset := uintptr(unsafe.Pointer(unsafe.SliceData(buf))) & (cpu.CacheLineSize - 1)
-
-		if offset == 8 { // Make sure the offset hasn't changed for the newly allocated slice
-			alignedPadding := (-uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) & (cpu.CacheLineSize - 1)
-			alignedPtr := unsafe.Add(unsafe.Pointer(unsafe.SliceData(buf)), alignedPadding)
+	// n+2 buckets gives 128 bytes of leading slack, enough for the longest
+	// padding the rotation needs (120 bytes when CacheLineSize=128). We pick
+	// the layout from the byte size to avoid a wasted probe allocation; the
+	// addr&63 checks just guard against the runtime contract changing.
+	if mallocgcAddsHeader(n) {
+		rotBuf := make([]PrimaryBucketRot8[K, V], n+2)
+		rotAddr := uintptr(unsafe.Pointer(unsafe.SliceData(rotBuf)))
+		if rotAddr&63 == 8 {
+			padding := (-rotAddr) & (cpu.CacheLineSize - 1)
+			alignedPtr := unsafe.Add(unsafe.Pointer(unsafe.SliceData(rotBuf)), padding)
 			return unsafe.Slice((*PrimaryBucket[K, V])(alignedPtr), n)
 		}
-		// TODO - add additional alignments, at the moment other offsets will fallback to heap allocation
+	} else {
+		buf := make([]PrimaryBucket[K, V], n+2)
+		addr := uintptr(unsafe.Pointer(unsafe.SliceData(buf)))
+		if addr&63 == 0 {
+			// On arm64 we may need to drop the first bucket to land on the next
+			// 128-byte cache line; on amd64 the skip is always 0.
+			skip := uint64((-addr)&(cpu.CacheLineSize-1)) / 64
+			return buf[skip : skip+n : skip+n]
+		}
 	}
-	// Fallback - allocate large buffer to heap allocation to ensure alignment,
-	// can handle additional offsets as a later improvement instead of this
-	return make([]PrimaryBucket[K, V], max(n, LargeBufferSize))[:n:n]
+	// LargeBufferSize forces the large-object path, which gives a fresh
+	// page-aligned span.
+	return make([]PrimaryBucket[K, V], max(n, largeBufferSize))[:n:n]
 }
 
-// makeLinkAlignedSlice since LinkBucket is a sequence of (uint64, *V) pairs,
+// makeLinkAlignedSlice mirrors makePrimaryAlignedSlice; see that function for
+// the alignment scheme.
 func makeLinkAlignedSlice[K Key, V any](n uint64) []LinkBucket[K, V] {
-	buf := make([]LinkBucket[K, V], n+2)
-	offset := uintptr(unsafe.Pointer(unsafe.SliceData(buf))) & (cpu.CacheLineSize - 1)
-	switch offset {
-	case 0:
-		return buf[:n:n]
-	case 8:
-		buf := make([]LinkBucketRot8[K, V], n+2)
-		offset := uintptr(unsafe.Pointer(unsafe.SliceData(buf))) & (cpu.CacheLineSize - 1)
-
-		if offset == 8 {
-			alignedPadding := (-uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) & (cpu.CacheLineSize - 1)
-			alignedPtr := unsafe.Add(unsafe.Pointer(unsafe.SliceData(buf)), alignedPadding)
+	if mallocgcAddsHeader(n) {
+		rotBuf := make([]LinkBucketRot8[K, V], n+2)
+		rotAddr := uintptr(unsafe.Pointer(unsafe.SliceData(rotBuf)))
+		if rotAddr&63 == 8 {
+			padding := (-rotAddr) & (cpu.CacheLineSize - 1)
+			alignedPtr := unsafe.Add(unsafe.Pointer(unsafe.SliceData(rotBuf)), padding)
 			return unsafe.Slice((*LinkBucket[K, V])(alignedPtr), n)
 		}
-		// TODO - add additional alignments, at the moment other offsets will fallback to heap allocation
+	} else {
+		buf := make([]LinkBucket[K, V], n+2)
+		addr := uintptr(unsafe.Pointer(unsafe.SliceData(buf)))
+		if addr&63 == 0 {
+			skip := uint64((-addr)&(cpu.CacheLineSize-1)) / 64
+			return buf[skip : skip+n : skip+n]
+		}
 	}
-	return make([]LinkBucket[K, V], max(n, LargeBufferSize))[:n:n]
+	return make([]LinkBucket[K, V], max(n, largeBufferSize))[:n:n]
 }
