@@ -177,7 +177,40 @@ func TestStats_PostResizeAccuracy(t *testing.T) {
 	}
 }
 
-func TestStats_TryingSlotsNotCounted(t *testing.T) {
+func TestSize_EmptyMap(t *testing.T) {
+	m := New[uint64, int](Options{InitialSize: 64})
+	if got := m.Size(); got != 0 {
+		t.Errorf("Size: got %d, want 0", got)
+	}
+}
+
+func TestSize_AfterInserts(t *testing.T) {
+	m := New[uint64, int](Options{InitialSize: 64})
+	const N uint64 = 50
+	for i := range N {
+		m.Insert(i, int(i))
+	}
+	if got := m.Size(); got != N {
+		t.Errorf("Size: got %d, want %d", got, N)
+	}
+}
+
+func TestSize_AfterDeletes(t *testing.T) {
+	m := New[uint64, int](Options{InitialSize: 64})
+	const N uint64 = 30
+	for i := range N {
+		m.Insert(i, int(i))
+	}
+	const D uint64 = 10
+	for i := range D {
+		m.Delete(i)
+	}
+	if got := m.Size(); got != N-D {
+		t.Errorf("Size: got %d, want %d", got, N-D)
+	}
+}
+
+func TestSize_TryingSlotsNotCounted(t *testing.T) {
 	m := newWithSeed[uint64, int](Options{InitialSize: 16}, testSeed)
 	idx := m.getActiveIndex()
 	pb := idx.getBinByIndex(0)
@@ -185,7 +218,7 @@ func TestStats_TryingSlotsNotCounted(t *testing.T) {
 	h := atomicLoadHeader(&pb.Header)
 	atomic.StoreUint64((*uint64)(&pb.Header), uint64(h.setSlotStateAndVersion(0, SlotTrying)))
 
-	if got := m.Stats().Size; got != 0 {
+	if got := m.Size(); got != 0 {
 		t.Errorf("Size: got %d, want 0 (Trying slots must not count)", got)
 	}
 }

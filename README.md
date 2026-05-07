@@ -49,6 +49,10 @@ func main() {
         return true // return false to stop early
     })
 
+    // Approximate entry count
+	size := m.Size()
+	fmt.Printf("Size: %d\n", size)
+
     // Get statistics
     stats := m.Stats()
     fmt.Printf("Load factor: %.3f\n", stats.LoadFactor)
@@ -71,6 +75,7 @@ func main() {
 - `Insert(key K, value V) (V, bool)`: Insert a new key-value pair
 - `Put(key K, value V) (V, bool)`: Update an existing key atomically
 - `Delete(key K) (V, bool)`: Delete a key and return the old value
+- `Size() uint64`: Approximate count of valid entries
 - `Stats() Stats`: Get current statistics
 - `Range(yield func(K, V) bool)`: Iterate every `(key, value)` pair; return `false` from yield to stop early
 - `All() iter.Seq2[K, V]`: Range adapter for `for k, v := range m.All()`
