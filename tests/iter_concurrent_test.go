@@ -49,7 +49,7 @@ func TestIter_DuringResize(t *testing.T) {
 	for k := uint64(1); k <= stableSize; k++ {
 		m.Insert(k, k*10)
 	}
-	initialBins := m.Stats().NumBins
+	initialBins := m.Stats().Bins
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -88,7 +88,7 @@ func TestIter_DuringResize(t *testing.T) {
 	close(stop)
 	wg.Wait()
 
-	if got := m.Stats().NumBins; got <= initialBins {
+	if got := m.Stats().Bins; got <= initialBins {
 		t.Errorf("expected resize during the loop; bins=%d, initial=%d", got, initialBins)
 	}
 }

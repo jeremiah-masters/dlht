@@ -1,8 +1,7 @@
 package inline
 
 import (
-	"fmt"
-	"strings"
+	"math/bits"
 	"sync/atomic"
 )
 
@@ -18,72 +17,68 @@ func New[V Integer](opts Options) *Map[V] {
 	return m
 }
 
+// Stats is an approximate snapshot of the table's size and load.
 type Stats struct {
-	NumBins      uint64  // Number of primary bins
-	NumLinks     uint64  // Number of allocated link buckets
-	NumSlots     uint64  // Total number of slots (primary + link)
-	LoadFactor   float64 // Estimated load factor
-	ChainLengths []int   // Distribution of chain lengths
+	Bins         uint64  // primary bins
+	Links        uint64  // link buckets allocated
+	LinkCapacity uint64  // total link buckets
+	Size         uint64  // entries in the map
+	Capacity     uint64  // max entries before forced resize
+	LoadFactor   float64 // Size / Capacity
+	Resizing     bool    // a resize is in progress
 }
 
-// Stats returns current statistics about the hash table
+// Stats returns an approximate snapshot of the table's size and load.
+//
+// The walk is per-bin atomic, not per-table atomic and not snapshot.
+// Each bin's slot states are observed atomically via a single header
+// load, but two bins are observed at different moments. Concurrent
+// Insert/Delete/Put/resize may or may not be reflected in Size.
+//
+// Stats reads the index that was active when the call began. If a
+// resize completes mid-call, the returned counts reflect that
+// now-stale index.
 func (m *Map[V]) Stats() Stats {
 	idx := m.getActiveIndex()
 
-	stats := Stats{
-		NumBins:      uint64(len(idx.bins)),
-		NumLinks:     uint64(atomic.LoadUint32(&idx.linkNext)),
-		NumSlots:     uint64(len(idx.bins))*PRIMARY_SLOTS + uint64(atomic.LoadUint32(&idx.linkNext))*LINK_SLOTS,
-		ChainLengths: make([]int, MAX_LINKS+1),
+	bins := uint64(len(idx.bins))
+	arenaLen := uint64(len(idx.links))
+	bottomCap := uint64(atomic.LoadUint32(&idx.linkCapacity))
+	linkNext := uint64(atomic.LoadUint32(&idx.linkNext))
+
+	// Resize completion sets linkCapacity = linkNextResize-1 to fence normal
+	// bottom-up allocs off the top-down resize tail; the lowest resize-allocated
+	// link index is linkCapacity+1. So the transfer-time allocation count is
+	// arenaLen-linkCapacity-1 post-resize, and 0 for fresh indexes where
+	// linkCapacity == arenaLen.
+	var transferLinks uint64
+	if bottomCap < arenaLen {
+		transferLinks = arenaLen - bottomCap - 1
 	}
 
-	// Count occupied slots and chain lengths
-	var occupiedSlots uint64
+	// Slot states pack as 15 * 2 bits in [29:0]: Valid=0b10, Trying=0b01,
+	// Invalid=0b00. The mask 0x2AAAAAAA has the high bit of each pair set
+	// (positions 1, 3, ..., 29); popcount of h & mask counts valid slots.
+	const validMask uint32 = 0x2AAAAAAA
+	var size uint64
 	for i := range idx.bins {
-		pb := &idx.bins[i]
-		h := atomicLoadHeader(&pb.Header)
-
-		// Count occupied slots in this bin
-		var binOccupied int
-		for j := 0; j < MAX_SLOTS_PER_BIN; j++ {
-			if h.getSlotState(j) == SlotValid {
-				binOccupied++
-				occupiedSlots++
-			}
-		}
-
-		// Count attached links for chain length distribution
-		lm := atomicLoadLinkMeta(&pb.LinkMeta)
-		chainLength := lm.getAttachedLinkCount()
-		if chainLength < len(stats.ChainLengths) {
-			stats.ChainLengths[chainLength]++
-		}
+		h := atomicLoadHeader(&idx.bins[i].Header)
+		size += uint64(bits.OnesCount32(uint32(h) & validMask))
 	}
 
-	if stats.NumSlots > 0 {
-		stats.LoadFactor = float64(occupiedSlots) / float64(stats.NumSlots)
+	capacity := bins * MAX_SLOTS_PER_BIN
+	var lf float64
+	if capacity > 0 {
+		lf = float64(size) / float64(capacity)
 	}
 
-	return stats
-}
-
-// String returns a formatted string representation of the statistics
-func (s Stats) String() string {
-	var sb strings.Builder
-
-	sb.WriteString("Hash Table Statistics:\n")
-	sb.WriteString(fmt.Sprintf("  Bins: %d\n", s.NumBins))
-	sb.WriteString(fmt.Sprintf("  Links: %d\n", s.NumLinks))
-	sb.WriteString(fmt.Sprintf("  Total Slots: %d\n", s.NumSlots))
-	sb.WriteString(fmt.Sprintf("  Load Factor: %.3f\n", s.LoadFactor))
-
-	sb.WriteString("  Chain Length Distribution:\n")
-	for i, count := range s.ChainLengths {
-		if count > 0 {
-			percentage := float64(count) / float64(s.NumBins) * 100
-			sb.WriteString(fmt.Sprintf("    %d links: %d bins (%.1f%%)\n", i, count, percentage))
-		}
+	return Stats{
+		Bins:         bins,
+		Links:        linkNext + transferLinks,
+		LinkCapacity: arenaLen,
+		Size:         size,
+		Capacity:     capacity,
+		LoadFactor:   lf,
+		Resizing:     m.resizeCtx.Load() != nil,
 	}
-
-	return sb.String()
 }
