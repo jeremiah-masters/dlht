@@ -10,6 +10,7 @@ type MapAdapter[K comparable, V any] interface {
 	Insert(key K, value V) bool // insert-if-absent; true if inserted (key was new)
 	Delete(key K) bool          // true if deleted (key existed)
 	Put(key K, value V) bool    // update-if-exists; true if updated (key existed)
+	Range(yield func(K, V) bool)
 	Size() int
 	Close()
 }
@@ -35,7 +36,7 @@ func Uint64MapFactories() []NamedFactory[uint64, uint64] {
 	}
 }
 
-// StringMapFactories returns benchmark factories for the allocator-backed DLHT
+// StringMapFactories returns benchmark factories for the allocator-backed DLHT map
 // plus the external string-key baselines.
 func StringMapFactories() []NamedFactory[string, string] {
 	return []NamedFactory[string, string]{

@@ -1,25 +1,20 @@
 package adapters
 
-import cmap "github.com/orcaman/concurrent-map"
+import cmap "github.com/orcaman/concurrent-map/v2"
 
 type orcamanAdapter[K ~string, V any] struct {
-	m cmap.ConcurrentMap
+	m cmap.ConcurrentMap[string, V]
 }
 
 func NewOrcamanAdapter[K ~string, V any](capacity int) MapAdapter[K, V] {
 	_ = capacity // orcaman/concurrent-map does not expose capacity tuning.
-	return &orcamanAdapter[K, V]{m: cmap.New()}
+	return &orcamanAdapter[K, V]{m: cmap.New[V]()}
 }
 
 func (a *orcamanAdapter[K, V]) Name() string { return "orcaman" }
 
 func (a *orcamanAdapter[K, V]) Get(key K) (V, bool) {
-	val, ok := a.m.Get(string(key))
-	if !ok {
-		var zero V
-		return zero, false
-	}
-	return val.(V), true
+	return a.m.Get(string(key))
 }
 
 func (a *orcamanAdapter[K, V]) Insert(key K, val V) bool {
@@ -39,6 +34,12 @@ func (a *orcamanAdapter[K, V]) Put(key K, val V) bool {
 		return true
 	}
 	return false
+}
+
+func (a *orcamanAdapter[K, V]) Range(yield func(K, V) bool) {
+	a.m.IterCb(func(key string, v V) {
+		yield(K(key), v)
+	})
 }
 
 func (a *orcamanAdapter[K, V]) Size() int { return a.m.Count() }

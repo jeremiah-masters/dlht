@@ -30,5 +30,9 @@ func (a *xsyncAdapter[K, V]) Put(key K, val V) bool {
 	return loaded // true if updated (key existed)
 }
 
+func (a *xsyncAdapter[K, V]) Range(yield func(K, V) bool) {
+	a.m.Range(yield)
+}
+
 func (a *xsyncAdapter[K, V]) Size() int { return a.m.Size() }
 func (a *xsyncAdapter[K, V]) Close()    {}
