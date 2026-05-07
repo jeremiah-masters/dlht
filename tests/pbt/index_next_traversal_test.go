@@ -77,18 +77,18 @@ func TestPBTIndexNextTraversal(t *testing.T) {
 		}
 
 		statsAfter := m.Stats()
-		if statsAfter.NumBins <= statsAfterPrefill.NumBins {
+		if statsAfter.Bins <= statsAfterPrefill.Bins {
 			t.Fatalf(
 				"expected resize growth during concurrent phase: bins_after_prefill=%d bins_after=%d",
-				statsAfterPrefill.NumBins,
-				statsAfter.NumBins,
+				statsAfterPrefill.Bins,
+				statsAfter.Bins,
 			)
 		}
-		if statsAfter.NumBins < statsInitial.NumBins*64 {
+		if statsAfter.Bins < statsInitial.Bins*64 {
 			t.Fatalf(
 				"expected multiple resize generations for indexNext traversal: bins_initial=%d bins_after=%d",
-				statsInitial.NumBins,
-				statsAfter.NumBins,
+				statsInitial.Bins,
+				statsAfter.Bins,
 			)
 		}
 

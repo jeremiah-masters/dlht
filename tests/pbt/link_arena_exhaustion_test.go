@@ -72,16 +72,16 @@ func TestPBTLinkArenaExhaustionLowCount(t *testing.T) {
 		}
 
 		stats1 := m.Stats()
-		if stats1.NumLinks < stats0.NumLinks {
-			t.Fatalf("link allocation decreased: before=%d after=%d", stats0.NumLinks, stats1.NumLinks)
+		if stats1.Links < stats0.Links {
+			t.Fatalf("link allocation decreased: before=%d after=%d", stats0.Links, stats1.Links)
 		}
-		if stats1.NumLinks == stats0.NumLinks && stats1.NumBins == stats0.NumBins {
+		if stats1.Links == stats0.Links && stats1.Bins == stats0.Bins {
 			t.Fatalf(
 				"expected link pressure evidence, got no link growth and no resize: links_before=%d links_after=%d bins_before=%d bins_after=%d",
-				stats0.NumLinks,
-				stats1.NumLinks,
-				stats0.NumBins,
-				stats1.NumBins,
+				stats0.Links,
+				stats1.Links,
+				stats0.Bins,
+				stats1.Bins,
 			)
 		}
 	})

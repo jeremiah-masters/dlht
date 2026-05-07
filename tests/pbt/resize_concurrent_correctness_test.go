@@ -50,11 +50,11 @@ func TestPBTResizeConcurrentCorrectness(t *testing.T) {
 		}
 
 		statsAfterConcurrent := m.Stats()
-		if statsAfterConcurrent.NumBins <= statsAfterPrefill.NumBins {
+		if statsAfterConcurrent.Bins <= statsAfterPrefill.Bins {
 			t.Fatalf(
 				"expected concurrent phase resize growth: bins_after_prefill=%d bins_after_concurrent=%d",
-				statsAfterPrefill.NumBins,
-				statsAfterConcurrent.NumBins,
+				statsAfterPrefill.Bins,
+				statsAfterConcurrent.Bins,
 			)
 		}
 

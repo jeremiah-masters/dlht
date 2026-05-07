@@ -52,11 +52,11 @@ func TestPBTCooperativeResizeLiveness(t *testing.T) {
 		wg.Wait()
 
 		statsAfter := m.Stats()
-		if statsAfter.NumBins <= statsBefore.NumBins {
+		if statsAfter.Bins <= statsBefore.Bins {
 			rt.Fatalf(
 				"expected resize growth during liveness run: bins_before=%d bins_after=%d",
-				statsBefore.NumBins,
-				statsAfter.NumBins,
+				statsBefore.Bins,
+				statsAfter.Bins,
 			)
 		}
 	})
