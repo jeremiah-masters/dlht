@@ -56,15 +56,7 @@ func (m *Map[K, V]) Stats() Stats {
 		transferLinks = arenaLen - bottomCap - 1
 	}
 
-	// Slot states pack as 15 * 2 bits in [29:0]: Valid=0b10, Trying=0b01,
-	// Invalid=0b00. The mask 0x2AAAAAAA has the high bit of each pair set
-	// (positions 1, 3, ..., 29); popcount of h & mask counts valid slots.
-	const validMask uint32 = 0x2AAAAAAA
-	var size uint64
-	for i := range idx.bins {
-		h := atomicLoadHeader(&idx.bins[i].Header)
-		size += uint64(bits.OnesCount32(uint32(h) & validMask))
-	}
+	size := idx.validSlotCount()
 
 	capacity := bins * MAX_SLOTS_PER_BIN
 	var lf float64
@@ -81,4 +73,33 @@ func (m *Map[K, V]) Stats() Stats {
 		LoadFactor:   lf,
 		Resizing:     m.resizeCtx.Load() != nil,
 	}
+}
+
+// Size returns the approximate number of valid entries in the map.
+//
+// Per-bin atomic, not snapshot: each bin's slot states load atomically,
+// but bins are observed at different moments, so concurrent
+// Insert/Delete/Put/resize may or may not be reflected. Reads the index
+// that was active when the call began; if a resize completes mid-call,
+// the returned count reflects that now-stale index.
+//
+// O(Bins): one atomic header load per bin.
+func (m *Map[K, V]) Size() uint64 {
+	return m.getActiveIndex().validSlotCount()
+}
+
+// validSlotCount sums Valid slots across all primary bins via one
+// atomic header load per bin.
+//
+// Slot states pack as 15 * 2 bits in [29:0]: Valid=0b10, Trying=0b01,
+// Invalid=0b00. The mask 0x2AAAAAAA has the high bit of each pair set
+// (positions 1, 3, ..., 29); popcount of h & mask counts valid slots.
+func (idx *index[K, V]) validSlotCount() uint64 {
+	const validMask uint32 = 0x2AAAAAAA
+	var n uint64
+	for i := range idx.bins {
+		h := atomicLoadHeader(&idx.bins[i].Header)
+		n += uint64(bits.OnesCount32(uint32(h) & validMask))
+	}
+	return n
 }

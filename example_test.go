@@ -42,6 +42,10 @@ func Example() {
 		fmt.Printf("Deleted banana (old value: %d)\n", oldValue)
 	}
 
+	// Approximate entry count
+	size := m.Size()
+	fmt.Printf("Size: %d\n", size)
+
 	// Print statistics
 	stats := m.Stats()
 	fmt.Printf("Map has %d bins with load factor %.3f\n", stats.Bins, stats.LoadFactor)
@@ -52,6 +56,7 @@ func Example() {
 	// Updated apple: 5 -> 10
 	// Current value: apple = 10
 	// Deleted banana (old value: 3)
+	// Size: 2
 	// Map has 64 bins with load factor 0.002
 }
 
