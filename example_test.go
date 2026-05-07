@@ -90,3 +90,21 @@ func Example_concurrent() {
 	fmt.Printf("Concurrent operations completed successfully\n")
 	fmt.Printf("Inserted and found %d items\n", foundItems)
 }
+
+// ExampleMap_Range walks every entry; yield can return false to stop early.
+func ExampleMap_Range() {
+	m := dlht.New[string, int](dlht.Options{InitialSize: 16})
+	m.Insert("apple", 1)
+	m.Insert("banana", 2)
+	m.Insert("cherry", 3)
+
+	total := 0
+	m.Range(func(_ string, v int) bool {
+		total += v
+		return true
+	})
+	fmt.Printf("total: %d\n", total)
+
+	// Output:
+	// total: 6
+}

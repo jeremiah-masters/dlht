@@ -21,7 +21,7 @@ import (
 )
 
 func main() {
-    // Create a new DLHT
+    // Create a new DLHT Map
     m := dlht.New[string, int](dlht.Options{InitialSize: 64})
 
     // Insert key-value pairs
@@ -43,6 +43,12 @@ func main() {
         fmt.Printf("Deleted banana (old value: %d)\n", oldValue)
     }
 
+    // Iterate every (key, value) currently in the map.
+    m.Range(func(k string, v int) bool {
+        fmt.Printf("%s = %d\n", k, v)
+        return true // return false to stop early
+    })
+
     // Get statistics
     stats := m.Stats()
     fmt.Printf("Load factor: %.3f\n", stats.LoadFactor)
@@ -54,19 +60,22 @@ func main() {
 ### Types
 
 - `Map[K Key, V any]`: The main hash table type
-- `Entry[K Key, V any]`: A key-value pair
 - `Options`: Configuration options for creating a new map
 - `Stats`: Statistics about the hash table's current state
 - `Key`: Type constraint for valid key types (uint64 or string)
 
-### Functions
+### API
 
 - `New[K Key, V any](opts Options) *Map[K, V]`: Create a new DLHT
-- `(m *Map[K, V]) Get(key K) (V, bool)`: Get a value by key
-- `(m *Map[K, V]) Insert(key K, value V) (V, bool)`: Insert a new key-value pair
-- `(m *Map[K, V]) Put(key K, value V) (V, bool)`: Update an existing key atomically
-- `(m *Map[K, V]) Delete(key K) (V, bool)`: Delete a key and return the old value
-- `(m *Map[K, V]) Stats() Stats`: Get current statistics
+- `Get(key K) (V, bool)`: Get a value by key
+- `Insert(key K, value V) (V, bool)`: Insert a new key-value pair
+- `Put(key K, value V) (V, bool)`: Update an existing key atomically
+- `Delete(key K) (V, bool)`: Delete a key and return the old value
+- `Stats() Stats`: Get current statistics
+- `Range(yield func(K, V) bool)`: Iterate every `(key, value)` pair; return `false` from yield to stop early
+- `All() iter.Seq2[K, V]`: Range adapter for `for k, v := range m.All()`
+- `Keys() iter.Seq[K]`: Range over keys only
+- `Values() iter.Seq[V]`: Range over values only
 
 ## Implementation Details
 

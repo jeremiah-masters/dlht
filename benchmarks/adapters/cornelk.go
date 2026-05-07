@@ -34,5 +34,9 @@ func (a *cornelkAdapter[K, V]) Put(key K, val V) bool {
 	return false
 }
 
+func (a *cornelkAdapter[K, V]) Range(yield func(K, V) bool) {
+	a.m.Range(yield)
+}
+
 func (a *cornelkAdapter[K, V]) Size() int { return a.m.Len() }
 func (a *cornelkAdapter[K, V]) Close()    {}

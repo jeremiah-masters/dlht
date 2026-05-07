@@ -1,10 +1,15 @@
 package adapters
 
-import "github.com/alphadose/haxmap"
+import (
+	"cmp"
+	"unsafe"
+
+	"github.com/alphadose/haxmap"
+)
 
 // haxmapHashable mirrors the unexported hashable constraint from alphadose/haxmap.
 type haxmapHashable interface {
-	~int | ~int8 | ~int16 | ~int32 | ~int64 | ~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr | ~float32 | ~float64 | ~complex64 | ~complex128 | ~string
+	cmp.Ordered | uintptr | ~unsafe.Pointer
 }
 
 type haxMapAdapter[K haxmapHashable, V any] struct {
@@ -34,6 +39,12 @@ func (a *haxMapAdapter[K, V]) Delete(key K) bool {
 func (a *haxMapAdapter[K, V]) Put(key K, val V) bool {
 	_, swapped := a.m.Swap(key, val)
 	return swapped
+}
+
+func (a *haxMapAdapter[K, V]) Range(yield func(K, V) bool) {
+	a.m.ForEach(func(k K, v V) bool {
+		return yield(k, v)
+	})
 }
 
 func (a *haxMapAdapter[K, V]) Size() int { return int(a.m.Len()) }

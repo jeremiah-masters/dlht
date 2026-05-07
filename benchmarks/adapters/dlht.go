@@ -39,6 +39,9 @@ func (a *dlhtAllocatorBenchmarkAdapter[K, V]) Put(key K, val V) bool {
 	_, existed := a.m.Put(key, val)
 	return existed
 }
+func (a *dlhtAllocatorBenchmarkAdapter[K, V]) Range(yield func(K, V) bool) {
+	a.m.Range(yield)
+}
 func (a *dlhtAllocatorBenchmarkAdapter[K, V]) Size() int { return -1 }
 func (a *dlhtAllocatorBenchmarkAdapter[K, V]) Close()    {}
 
@@ -56,6 +59,9 @@ func (a *dlhtInlineBenchmarkAdapter) Delete(key uint64) bool {
 func (a *dlhtInlineBenchmarkAdapter) Put(key, val uint64) bool {
 	_, existed := a.m.Put(key, val)
 	return existed
+}
+func (a *dlhtInlineBenchmarkAdapter) Range(yield func(uint64, uint64) bool) {
+	a.m.Range(yield)
 }
 func (a *dlhtInlineBenchmarkAdapter) Size() int { return -1 }
 func (a *dlhtInlineBenchmarkAdapter) Close()    {}

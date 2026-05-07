@@ -44,4 +44,10 @@ func (a *syncMapAdapter[K, V]) Size() int {
 	return n
 }
 
+func (a *syncMapAdapter[K, V]) Range(yield func(K, V) bool) {
+	a.m.Range(func(k, v any) bool {
+		return yield(k.(K), v.(V))
+	})
+}
+
 func (a *syncMapAdapter[K, V]) Close() {}
