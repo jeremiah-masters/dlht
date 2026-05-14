@@ -320,6 +320,261 @@ func testMap(t *testing.T, newMap func() *dlht.Map[string, int]) {
 			}
 		})
 	})
+
+	t.Run("LoadOrComputeOnce", func(t *testing.T) {
+		t.Run("All", func(t *testing.T) {
+			m := newMap()
+
+			for i, s := range mapTestData {
+				expectComputed(t, s, i)(m.LoadOrComputeOnce(s, func() (int, bool) { return i, true }))
+				expectPresent(t, s, i)(m.Get(s))
+				expectLoaded(t, s, i)(m.LoadOrComputeOnce(s, func() (int, bool) { return 999, true }))
+				expectPresent(t, s, i)(m.Get(s))
+			}
+		})
+
+		t.Run("AfterDelete", func(t *testing.T) {
+			m := newMap()
+
+			for i, s := range mapTestDataSmall {
+				expectComputed(t, s, i)(m.LoadOrComputeOnce(s, func() (int, bool) { return i, true }))
+				expectDeleted(t, s, i)(m.Delete(s))
+				expectComputed(t, s, i+100)(m.LoadOrComputeOnce(s, func() (int, bool) { return i + 100, true }))
+				expectPresent(t, s, i+100)(m.Get(s))
+			}
+		})
+
+		t.Run("ConcurrentUnsharedKeys", func(t *testing.T) {
+			m := newMap()
+
+			gmp := runtime.GOMAXPROCS(0)
+			var wg sync.WaitGroup
+			for i := range gmp {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+
+					makeKey := func(s string) string {
+						return s + "-" + strconv.Itoa(id)
+					}
+					for _, s := range mapTestDataSmall {
+						key := makeKey(s)
+						expectComputed(t, key, id)(m.LoadOrComputeOnce(key, func() (int, bool) { return id, true }))
+						expectLoaded(t, key, id)(m.LoadOrComputeOnce(key, func() (int, bool) { return 999, true }))
+					}
+					for _, s := range mapTestDataSmall {
+						key := makeKey(s)
+						expectPresent(t, key, id)(m.Get(key))
+					}
+				}(i)
+			}
+			wg.Wait()
+		})
+
+		t.Run("ConcurrentSharedKeys", func(t *testing.T) {
+			m := newMap()
+
+			var wins [len(mapTestDataSmall)]atomic.Int32
+			gmp := runtime.GOMAXPROCS(0)
+			var wg sync.WaitGroup
+			for i := range gmp {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+
+					for j, s := range mapTestDataSmall {
+						_, loaded := m.LoadOrComputeOnce(s, func() (int, bool) { return id, true })
+						if !loaded {
+							wins[j].Add(1)
+						}
+					}
+				}(i)
+			}
+			wg.Wait()
+
+			for i, s := range mapTestDataSmall {
+				if n := wins[i].Load(); n != 1 {
+					t.Errorf("key %q had %d computes, want 1", s, n)
+				}
+				v, ok := m.Get(s)
+				if !ok {
+					t.Errorf("expected key %q to be present", s)
+					continue
+				}
+				if v < 0 || v >= gmp {
+					t.Errorf("key %q has value=%d, want in [0,%d)", s, v, gmp)
+				}
+			}
+		})
+
+		t.Run("FnCalledOnce", func(t *testing.T) {
+			m := newMap()
+
+			var fnCalls [len(mapTestDataSmall)]atomic.Int32
+			gmp := runtime.GOMAXPROCS(0)
+			var wg sync.WaitGroup
+			for i := range gmp {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+					for j, s := range mapTestDataSmall {
+						m.LoadOrComputeOnce(s, func() (int, bool) {
+							fnCalls[j].Add(1)
+							return id, true
+						})
+					}
+				}(i)
+			}
+			wg.Wait()
+
+			for i, s := range mapTestDataSmall {
+				if calls := fnCalls[i].Load(); calls != 1 {
+					t.Errorf("key %q: fn called %d times, want exactly 1", s, calls)
+				}
+				if _, ok := m.Get(s); !ok {
+					t.Errorf("expected key %q to be present", s)
+				}
+			}
+		})
+	})
+
+	t.Run("LoadOrComputeOnce/SaveFalse", func(t *testing.T) {
+		m := newMap()
+
+		// save=false should not store; value returned as-is
+		v, loaded := m.LoadOrComputeOnce("key", func() (int, bool) { return 42, false })
+		if loaded {
+			t.Error("expected loaded=false")
+		}
+		if v != 42 {
+			t.Errorf("expected 42 (returned as-is), got %d", v)
+		}
+		if m.Contains("key") {
+			t.Error("key should not be in map after save=false")
+		}
+
+		// save=true should store
+		v, loaded = m.LoadOrComputeOnce("key", func() (int, bool) { return 42, true })
+		if loaded {
+			t.Error("expected loaded=false (computed)")
+		}
+		if v != 42 {
+			t.Errorf("expected 42, got %d", v)
+		}
+		expectPresent(t, "key", 42)(m.Get("key"))
+	})
+
+	t.Run("LoadOrCompute", func(t *testing.T) {
+		t.Run("All", func(t *testing.T) {
+			m := newMap()
+
+			for i, s := range mapTestData {
+				expectComputed(t, s, i)(m.LoadOrCompute(s, func() (int, bool) { return i, true }))
+				expectPresent(t, s, i)(m.Get(s))
+				// Second call should load, not compute
+				expectLoaded(t, s, i)(m.LoadOrCompute(s, func() (int, bool) { return 999, true }))
+				expectPresent(t, s, i)(m.Get(s))
+			}
+		})
+
+		t.Run("AfterDelete", func(t *testing.T) {
+			m := newMap()
+
+			for i, s := range mapTestDataSmall {
+				expectComputed(t, s, i)(m.LoadOrCompute(s, func() (int, bool) { return i, true }))
+				expectDeleted(t, s, i)(m.Delete(s))
+				expectComputed(t, s, i+100)(m.LoadOrCompute(s, func() (int, bool) { return i + 100, true }))
+				expectPresent(t, s, i+100)(m.Get(s))
+			}
+		})
+
+		t.Run("ConcurrentUnsharedKeys", func(t *testing.T) {
+			m := newMap()
+
+			gmp := runtime.GOMAXPROCS(0)
+			var wg sync.WaitGroup
+			for i := range gmp {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+
+					makeKey := func(s string) string {
+						return s + "-" + strconv.Itoa(id)
+					}
+					for _, s := range mapTestDataSmall {
+						key := makeKey(s)
+						expectComputed(t, key, id)(m.LoadOrCompute(key, func() (int, bool) { return id, true }))
+						expectLoaded(t, key, id)(m.LoadOrCompute(key, func() (int, bool) { return 999, true }))
+					}
+					for _, s := range mapTestDataSmall {
+						key := makeKey(s)
+						expectPresent(t, key, id)(m.Get(key))
+					}
+				}(i)
+			}
+			wg.Wait()
+		})
+
+		t.Run("ConcurrentSharedKeys", func(t *testing.T) {
+			m := newMap()
+
+			var wins [len(mapTestDataSmall)]atomic.Int32
+			gmp := runtime.GOMAXPROCS(0)
+			var wg sync.WaitGroup
+			for i := range gmp {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+
+					for j, s := range mapTestDataSmall {
+						_, loaded := m.LoadOrCompute(s, func() (int, bool) { return id, true })
+						if !loaded {
+							wins[j].Add(1)
+						}
+					}
+				}(i)
+			}
+			wg.Wait()
+
+			for i, s := range mapTestDataSmall {
+				if n := wins[i].Load(); n != 1 {
+					t.Errorf("key %q had %d computes, want 1", s, n)
+				}
+				v, ok := m.Get(s)
+				if !ok {
+					t.Errorf("expected key %q to be present", s)
+					continue
+				}
+				if v < 0 || v >= gmp {
+					t.Errorf("key %q has value=%d, want in [0,%d)", s, v, gmp)
+				}
+			}
+		})
+	})
+
+	t.Run("LoadOrCompute/SaveFalse", func(t *testing.T) {
+		m := newMap()
+
+		v, loaded := m.LoadOrCompute("key", func() (int, bool) { return 42, false })
+		if loaded {
+			t.Error("expected loaded=false")
+		}
+		if v != 42 {
+			t.Errorf("expected 42 (returned as-is), got %d", v)
+		}
+		if m.Contains("key") {
+			t.Error("key should not be in map after save=false")
+		}
+
+		v, loaded = m.LoadOrCompute("key", func() (int, bool) { return 42, true })
+		if loaded {
+			t.Error("expected loaded=false (computed)")
+		}
+		if v != 42 {
+			t.Errorf("expected 42, got %d", v)
+		}
+		expectPresent(t, "key", 42)(m.Get("key"))
+	})
 }
 
 func expectPresent[K comparable, V comparable](t *testing.T, key K, want V) func(got V, ok bool) {
@@ -429,6 +684,34 @@ func expectDeleted[K comparable, V comparable](t *testing.T, key K, wantOld V) f
 		}
 		if old != wantOld {
 			t.Errorf("expected key %v delete old value %v, got %v", key, wantOld, old)
+		}
+	}
+}
+
+func expectComputed[K comparable, V comparable](t *testing.T, key K, want V) func(got V, loaded bool) {
+	t.Helper()
+	return func(got V, loaded bool) {
+		t.Helper()
+		if loaded {
+			t.Errorf("expected key %v to be computed (loaded=false), got loaded=true", key)
+			return
+		}
+		if got != want {
+			t.Errorf("expected computed key %v value %v, got %v", key, want, got)
+		}
+	}
+}
+
+func expectLoaded[K comparable, V comparable](t *testing.T, key K, want V) func(got V, loaded bool) {
+	t.Helper()
+	return func(got V, loaded bool) {
+		t.Helper()
+		if !loaded {
+			t.Errorf("expected key %v to be loaded (loaded=true), got loaded=false", key)
+			return
+		}
+		if got != want {
+			t.Errorf("expected loaded key %v value %v, got %v", key, want, got)
 		}
 	}
 }

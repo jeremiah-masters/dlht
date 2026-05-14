@@ -52,6 +52,36 @@ func TestPBTPerKeyLinearizabilityHotspot(t *testing.T) {
 	})
 }
 
+func TestPBTPerKeyLinearizabilityWithLoadOrCompute(t *testing.T) {
+	t.Run("String", func(t *testing.T) {
+		rapid.Check(t, func(t *rapid.T) {
+			keyspace := rapid.IntRange(1, 4).Draw(t, "keyspace")
+			threads := rapid.IntRange(2, 4).Draw(t, "threads")
+			opsPerThread := rapid.IntRange(1, 10).Draw(t, "opsPerThread")
+			initialSize := rapid.Uint64Range(4, 32).Draw(t, "initialSize")
+			runPerKeyLinearizabilityCaseWithMix(t, initialSize, threads, opsPerThread, GenStringKey(keyspace), MixWithLoadOrCompute)
+		})
+	})
+	t.Run("Uint64", func(t *testing.T) {
+		rapid.Check(t, func(t *rapid.T) {
+			keyspace := rapid.IntRange(1, 4).Draw(t, "keyspace")
+			threads := rapid.IntRange(2, 4).Draw(t, "threads")
+			opsPerThread := rapid.IntRange(1, 10).Draw(t, "opsPerThread")
+			initialSize := rapid.Uint64Range(4, 32).Draw(t, "initialSize")
+			runPerKeyLinearizabilityCaseWithMix(t, initialSize, threads, opsPerThread, GenUint64Key(keyspace), MixWithLoadOrCompute)
+		})
+	})
+	t.Run("ChurnString", func(t *testing.T) {
+		rapid.Check(t, func(t *rapid.T) {
+			keyspace := rapid.IntRange(1, 4).Draw(t, "keyspace")
+			threads := rapid.IntRange(2, 4).Draw(t, "threads")
+			opsPerThread := rapid.IntRange(1, 10).Draw(t, "opsPerThread")
+			initialSize := rapid.Uint64Range(4, 32).Draw(t, "initialSize")
+			runPerKeyLinearizabilityCaseWithMix(t, initialSize, threads, opsPerThread, GenStringKey(keyspace), MixChurnWithLoadOrCompute)
+		})
+	})
+}
+
 func TestPBTPerKeyLinearizabilityCorpus(t *testing.T) {
 	t.Run("String", func(t *testing.T) {
 		rapid.Check(t, func(t *rapid.T) {

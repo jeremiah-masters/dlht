@@ -112,6 +112,14 @@ func perKeyModel[V comparable](initial perKeyState[V]) porcupine.Model {
 				expected := perKeyOutput[V]{Found: false, Value: zero}
 				return out == expected, s
 
+			case OpLoadOrCompute:
+				if s.exists {
+					expected := perKeyOutput[V]{Found: true, Value: s.value}
+					return out == expected, s
+				}
+				expected := perKeyOutput[V]{Found: false, Value: in.Value}
+				return out == expected, perKeyState[V]{exists: true, value: in.Value}
+
 			default:
 				return false, s
 			}
@@ -147,6 +155,11 @@ func perKeyModel[V comparable](initial perKeyState[V]) porcupine.Model {
 					return fmt.Sprintf("Delete → deleted (was %v)", out.Value)
 				}
 				return "Delete → not found"
+			case OpLoadOrCompute:
+				if out.Found {
+					return fmt.Sprintf("LoadOrCompute(%v) → loaded %v", in.Value, out.Value)
+				}
+				return fmt.Sprintf("LoadOrCompute(%v) → computed", in.Value)
 			default:
 				return fmt.Sprintf("Unknown(%d)", in.Kind)
 			}

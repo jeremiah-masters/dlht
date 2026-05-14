@@ -4,6 +4,7 @@ import (
 	"structs"
 	"sync/atomic"
 
+	"github.com/jeremiah-masters/dlht/allocator"
 	"github.com/jeremiah-masters/dlht/internal/cpu"
 )
 
@@ -77,7 +78,8 @@ type Map[V Integer] struct {
 	active     atomic.Pointer[index[V]] // Current active index
 	hashConfig HashConfig
 	_          [cpu.CacheLineSize - 32]byte // 32 = 8 (active) + 24 (HashConfig)
-	resizeCtx  atomic.Pointer[resizeContext[V]]
+	resizeCtx atomic.Pointer[resizeContext[V]]
+	compute   atomic.Pointer[allocator.Map[uint64, chan struct{}]]
 }
 
 type Options struct {

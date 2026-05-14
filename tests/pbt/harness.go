@@ -27,6 +27,9 @@ func execOp[K dlht.Key, V any](tb fatalfOnly, m *dlht.Map[K, V], op Op[K, V]) Op
 	case OpDelete:
 		deleted, ok := m.Delete(op.Key)
 		return OpResult[V]{Found: ok, Value: deleted}
+	case OpLoadOrCompute:
+		val, loaded := m.LoadOrCompute(op.Key, func() (V, bool) { return op.Value, true })
+		return OpResult[V]{Found: loaded, Value: val}
 	default:
 		tb.Fatalf("unknown op kind: %d", op.Kind)
 		var zero V
@@ -91,8 +94,12 @@ func filterTimedOpsByKey[K comparable, V any](ops []TimedOp[K, V], key K) []Time
 }
 
 func runPerKeyLinearizabilityCase[K dlht.Key](t *rapid.T, initialSize uint64, threads int, opsPerThread int, keyGen *rapid.Generator[K]) {
+	runPerKeyLinearizabilityCaseWithMix(t, initialSize, threads, opsPerThread, keyGen, MixChurn)
+}
+
+func runPerKeyLinearizabilityCaseWithMix[K dlht.Key](t *rapid.T, initialSize uint64, threads int, opsPerThread int, keyGen *rapid.Generator[K], mix OpMix) {
 	valGen := rapid.IntRange(-1000, 1000)
-	opsGen := GenOpSequence(keyGen, valGen, MixChurn, opsPerThread, opsPerThread)
+	opsGen := GenOpSequence(keyGen, valGen, mix, opsPerThread, opsPerThread)
 	opsByThread := drawOpsByThread(t, threads, opsGen, "ops")
 
 	m := dlht.New[K, int](dlht.Options{InitialSize: initialSize})

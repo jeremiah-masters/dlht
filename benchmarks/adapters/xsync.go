@@ -34,5 +34,20 @@ func (a *xsyncAdapter[K, V]) Range(yield func(K, V) bool) {
 	a.m.Range(yield)
 }
 
+func (a *xsyncAdapter[K, V]) LoadOrCompute(key K, fn func() (V, bool)) (V, bool) {
+	return a.m.LoadOrCompute(key, func() (V, bool) {
+		v, save := fn()
+		return v, !save // xsync: cancel=true means don't store
+	})
+}
+
+// xsync's LoadOrCompute already holds a bucket lock during compute, so fn is called at most once.
+func (a *xsyncAdapter[K, V]) LoadOrComputeOnce(key K, fn func() (V, bool)) (V, bool) {
+	return a.m.LoadOrCompute(key, func() (V, bool) {
+		v, save := fn()
+		return v, !save
+	})
+}
+
 func (a *xsyncAdapter[K, V]) Size() int { return a.m.Size() }
 func (a *xsyncAdapter[K, V]) Close()    {}
