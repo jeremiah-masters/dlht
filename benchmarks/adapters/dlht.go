@@ -42,6 +42,12 @@ func (a *dlhtAllocatorBenchmarkAdapter[K, V]) Put(key K, val V) bool {
 func (a *dlhtAllocatorBenchmarkAdapter[K, V]) Range(yield func(K, V) bool) {
 	a.m.Range(yield)
 }
+func (a *dlhtAllocatorBenchmarkAdapter[K, V]) LoadOrCompute(key K, fn func() (V, bool)) (V, bool) {
+	return a.m.LoadOrCompute(key, fn)
+}
+func (a *dlhtAllocatorBenchmarkAdapter[K, V]) LoadOrComputeOnce(key K, fn func() (V, bool)) (V, bool) {
+	return a.m.LoadOrComputeOnce(key, fn)
+}
 func (a *dlhtAllocatorBenchmarkAdapter[K, V]) Size() int { return -1 }
 func (a *dlhtAllocatorBenchmarkAdapter[K, V]) Close()    {}
 
@@ -62,6 +68,12 @@ func (a *dlhtInlineBenchmarkAdapter) Put(key, val uint64) bool {
 }
 func (a *dlhtInlineBenchmarkAdapter) Range(yield func(uint64, uint64) bool) {
 	a.m.Range(yield)
+}
+func (a *dlhtInlineBenchmarkAdapter) LoadOrCompute(key uint64, fn func() (uint64, bool)) (uint64, bool) {
+	return a.m.LoadOrCompute(key, fn)
+}
+func (a *dlhtInlineBenchmarkAdapter) LoadOrComputeOnce(key uint64, fn func() (uint64, bool)) (uint64, bool) {
+	return a.m.LoadOrComputeOnce(key, fn)
 }
 func (a *dlhtInlineBenchmarkAdapter) Size() int { return -1 }
 func (a *dlhtInlineBenchmarkAdapter) Close()    {}

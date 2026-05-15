@@ -219,6 +219,11 @@ func expectedResult[K comparable, V any](state keyState[V], op Op[K, V]) (OpResu
 			return OpResult[V]{Found: true, Value: state.value}, keyState[V]{}
 		}
 		return OpResult[V]{Found: false, Value: zero}, state
+	case OpLoadOrCompute:
+		if state.exists {
+			return OpResult[V]{Found: true, Value: state.value}, state
+		}
+		return OpResult[V]{Found: false, Value: op.Value}, keyState[V]{exists: true, value: op.Value}
 	default:
 		panic(fmt.Sprintf("unknown op kind in oracle: %d", op.Kind))
 	}

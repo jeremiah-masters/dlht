@@ -79,6 +79,46 @@ var linearizabilityTestConfigs = []TestConfig{
 		ContentionLevel: "low",
 		Description:     "Tests scalability with many clients and keys",
 	},
+	{
+		Name:            "LoadOrComputeRace",
+		NumClients:      8,
+		NumOpsPerClient: 50,
+		NumKeys:         4,
+		InitialSize:     8,
+		OpDistribution:  []float64{0.1, 0.1, 0.1, 0.1, 0.6},
+		ContentionLevel: "high",
+		Description:     "Tests LoadOrCompute race conditions under contention",
+	},
+	{
+		Name:            "MixedWithLoadOrCompute",
+		NumClients:      12,
+		NumOpsPerClient: 200,
+		NumKeys:         20,
+		InitialSize:     16,
+		OpDistribution:  []float64{0.3, 0.15, 0.15, 0.1, 0.3},
+		ContentionLevel: "medium",
+		Description:     "Realistic mixed workload including LoadOrCompute",
+	},
+	{
+		Name:            "LoadOrComputeOnceRace",
+		NumClients:      8,
+		NumOpsPerClient: 50,
+		NumKeys:         4,
+		InitialSize:     8,
+		OpDistribution:  []float64{0.1, 0.1, 0.1, 0.1, 0.0, 0.6},
+		ContentionLevel: "high",
+		Description:     "Tests LoadOrComputeOnce under high contention",
+	},
+	{
+		Name:            "MixedWithBothLoadOrCompute",
+		NumClients:      12,
+		NumOpsPerClient: 200,
+		NumKeys:         20,
+		InitialSize:     16,
+		OpDistribution:  []float64{0.2, 0.15, 0.15, 0.1, 0.15, 0.25},
+		ContentionLevel: "medium",
+		Description:     "Mixed workload with both LoadOrCompute variants",
+	},
 }
 
 var workloadPatterns = []WorkloadPattern{
@@ -256,6 +296,8 @@ func buildContentionOpSequences() []opSequence {
 		{"Get", OpGet},
 		{"Put", OpPut},
 		{"Delete", OpDelete},
+		{"LoadOrCompute", OpLoadOrCompute},
+		{"LoadOrComputeOnce", OpLoadOrComputeOnce},
 	}
 
 	var sequences []opSequence
@@ -275,6 +317,14 @@ func buildContentionOpSequences() []opSequence {
 		sequences = append(sequences, opSequence{
 			Name: fmt.Sprintf("DeleteInsertThen%s", tail.name),
 			Ops:  []int{OpDelete, OpInsert, tail.op},
+		})
+		sequences = append(sequences, opSequence{
+			Name: fmt.Sprintf("DeleteLoadOrComputeThen%s", tail.name),
+			Ops:  []int{OpDelete, OpLoadOrCompute, tail.op},
+		})
+		sequences = append(sequences, opSequence{
+			Name: fmt.Sprintf("DeleteLoadOrComputeOnceThen%s", tail.name),
+			Ops:  []int{OpDelete, OpLoadOrComputeOnce, tail.op},
 		})
 	}
 

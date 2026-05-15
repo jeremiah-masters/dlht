@@ -13,6 +13,7 @@ const (
 	opGet
 	opContains
 	opPut
+	opLoadOrCompute
 	opCount
 )
 
@@ -171,6 +172,20 @@ func checkNativeOp(t *testing.T, m *dlht.Map[uint64, uint32], model map[uint64]u
 			t.Fatalf("step=%d op=Put key=%d: expected (old=0, ok=false), got (old=%d, ok=%t)", step, key, gotOld, gotOK)
 		}
 
+	case opLoadOrCompute:
+		expVal, existed := model[key]
+		gotVal, gotLoaded := m.LoadOrCompute(key, func() (uint32, bool) { return val, true })
+		if existed {
+			if !gotLoaded || gotVal != expVal {
+				t.Fatalf("step=%d op=LoadOrCompute key=%d: expected (value=%d, loaded=true), got (value=%d, loaded=%t)", step, key, expVal, gotVal, gotLoaded)
+			}
+			return
+		}
+		if gotLoaded || gotVal != val {
+			t.Fatalf("step=%d op=LoadOrCompute key=%d: expected (value=%d, loaded=false), got (value=%d, loaded=%t)", step, key, val, gotVal, gotLoaded)
+		}
+		model[key] = val
+
 	default:
 		t.Fatalf("unknown operation: %d", op)
 	}
@@ -198,7 +213,7 @@ func normalizeKey(k uint64) uint64 {
 }
 
 func selectLongSequenceOp(opByte byte) uint8 {
-	switch opByte % 10 {
+	switch opByte % 12 {
 	case 0, 1:
 		return opGet
 	case 2, 3, 4:
@@ -207,8 +222,10 @@ func selectLongSequenceOp(opByte byte) uint8 {
 		return opPut
 	case 8:
 		return opDelete
-	default:
+	case 9:
 		return opContains
+	default:
+		return opLoadOrCompute
 	}
 }
 

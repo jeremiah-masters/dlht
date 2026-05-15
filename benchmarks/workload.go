@@ -10,6 +10,8 @@ const (
 	OpInsert
 	OpDelete
 	OpPut
+	OpLoadOrCompute
+	OpLoadOrComputeOnce
 )
 
 // Op is a single pre-generated operation in the benchmark stream.
@@ -20,13 +22,15 @@ type Op struct {
 
 // WorkloadDef defines a benchmark workload scenario.
 type WorkloadDef struct {
-	Name       string
-	GetPct     float64 // fraction of ops that are Get [0.0, 1.0]
-	InsertPct  float64 // fraction that are Insert
-	DeletePct  float64 // fraction that are Delete
-	PutPct     float64 // fraction that are Put
-	HotKeyMode bool    // if true, all ops target key index 0
-	PrefillPct float64 // fraction of keyspace to prefill before timing [0.0, 1.0]
+	Name                 string
+	GetPct               float64 // fraction of ops that are Get [0.0, 1.0]
+	InsertPct            float64 // fraction that are Insert
+	DeletePct            float64 // fraction that are Delete
+	PutPct               float64 // fraction that are Put
+	LoadOrComputePct     float64 // fraction that are LoadOrCompute
+	LoadOrComputeOncePct float64 // fraction that are LoadOrComputeOnce
+	HotKeyMode           bool    // if true, all ops target key index 0
+	PrefillPct           float64 // fraction of keyspace to prefill before timing [0.0, 1.0]
 }
 
 // Scenarios is the curated set of 7 workload scenarios.
@@ -83,6 +87,16 @@ var Scenarios = []WorkloadDef{
 		HotKeyMode: true,
 		PrefillPct: 0.75,
 	},
+	{
+		Name:             "ComputeIfAbsent",
+		LoadOrComputePct: 1.0,
+		PrefillPct:       10.0 / 11.0, // ~10:1 load-to-compute ratio
+	},
+	{
+		Name:                 "ComputeOnce",
+		LoadOrComputeOncePct: 1.0,
+		PrefillPct:           10.0 / 11.0, // ~10:1 load-to-compute ratio
+	},
 }
 
 // BuildOpStream generates a pre-determined operation stream for a workload.
@@ -117,15 +131,20 @@ func BuildOpStream(w WorkloadDef, numOps int, keyspaceSize int, rng *rand.Rand, 
 		// Choose operation type via weighted random
 		r := rng.Float64()
 		var opType OpType
+		cum := w.GetPct
 		switch {
-		case r < w.GetPct:
+		case r < cum:
 			opType = OpGet
-		case r < w.GetPct+w.InsertPct:
+		case r < cum+w.InsertPct:
 			opType = OpInsert
-		case r < w.GetPct+w.InsertPct+w.DeletePct:
+		case r < cum+w.InsertPct+w.DeletePct:
 			opType = OpDelete
-		default:
+		case r < cum+w.InsertPct+w.DeletePct+w.PutPct:
 			opType = OpPut
+		case r < cum+w.InsertPct+w.DeletePct+w.PutPct+w.LoadOrComputePct:
+			opType = OpLoadOrCompute
+		default:
+			opType = OpLoadOrComputeOnce
 		}
 
 		// Choose key index
@@ -134,7 +153,7 @@ func BuildOpStream(w WorkloadDef, numOps int, keyspaceSize int, rng *rand.Rand, 
 			keyIdx = 0
 		} else {
 			switch opType {
-			case OpGet:
+			case OpGet, OpLoadOrCompute, OpLoadOrComputeOnce:
 				// Sample from full keyspace, hit/miss naturally depends on prefill
 				keyIdx = sampleIndex(rng, keyspaceSize)
 			case OpInsert:

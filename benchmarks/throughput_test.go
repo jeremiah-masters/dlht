@@ -85,6 +85,10 @@ func runThroughputSuite[K comparable](
 												m.Delete(key)
 											case OpPut:
 												m.Put(key, key)
+											case OpLoadOrCompute:
+												m.LoadOrCompute(key, func() (K, bool) { return key, true })
+											case OpLoadOrComputeOnce:
+												m.LoadOrComputeOnce(key, func() (K, bool) { return key, true })
 											}
 											i++
 											if i >= nOps {

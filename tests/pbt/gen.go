@@ -13,6 +13,7 @@ const (
 	OpInsert
 	OpPut
 	OpDelete
+	OpLoadOrCompute
 )
 
 func (k OpKind) String() string {
@@ -25,6 +26,8 @@ func (k OpKind) String() string {
 		return "Put"
 	case OpDelete:
 		return "Delete"
+	case OpLoadOrCompute:
+		return "LoadOrCompute"
 	default:
 		return fmt.Sprintf("Unknown(%d)", k)
 	}
@@ -37,19 +40,22 @@ type Op[K comparable, V any] struct {
 }
 
 type OpMix struct {
-	Get    int
-	Insert int
-	Put    int
-	Delete int
+	Get           int
+	Insert        int
+	Put           int
+	Delete        int
+	LoadOrCompute int
 }
 
 var (
-	MixBalanced = OpMix{Get: 25, Insert: 25, Put: 25, Delete: 25}
-	MixChurn    = OpMix{Get: 10, Insert: 30, Put: 30, Delete: 30}
+	MixBalanced              = OpMix{Get: 25, Insert: 25, Put: 25, Delete: 25}
+	MixChurn                 = OpMix{Get: 10, Insert: 30, Put: 30, Delete: 30}
+	MixWithLoadOrCompute     = OpMix{Get: 20, Insert: 20, Put: 20, Delete: 20, LoadOrCompute: 20}
+	MixChurnWithLoadOrCompute = OpMix{Get: 8, Insert: 24, Put: 24, Delete: 24, LoadOrCompute: 20}
 )
 
 func (m OpMix) total() int {
-	return m.Get + m.Insert + m.Put + m.Delete
+	return m.Get + m.Insert + m.Put + m.Delete + m.LoadOrCompute
 }
 
 func (m OpMix) normalized() OpMix {
@@ -73,7 +79,11 @@ func DrawOpKind(t *rapid.T, mix OpMix) OpKind {
 	if r < m.Put {
 		return OpPut
 	}
-	return OpDelete
+	r -= m.Put
+	if r < m.Delete {
+		return OpDelete
+	}
+	return OpLoadOrCompute
 }
 
 func GenStringKey(keyspace int) *rapid.Generator[string] {
@@ -154,7 +164,7 @@ func GenOp[K comparable, V any](keyGen *rapid.Generator[K], valGen *rapid.Genera
 		kind := DrawOpKind(t, mix)
 		key := keyGen.Draw(t, "key")
 		var value V
-		if kind == OpInsert || kind == OpPut {
+		if kind == OpInsert || kind == OpPut || kind == OpLoadOrCompute {
 			value = valGen.Draw(t, "value")
 		}
 		return Op[K, V]{Kind: kind, Key: key, Value: value}
