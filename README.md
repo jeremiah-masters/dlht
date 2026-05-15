@@ -81,6 +81,8 @@ func main() {
 - `All() iter.Seq2[K, V]`: Range adapter for `for k, v := range m.All()`
 - `Keys() iter.Seq[K]`: Range over keys only
 - `Values() iter.Seq[V]`: Range over values only
+- `LoadOrCompute(K, func(V, bool)) (V, bool)`: Load or compute a value.
+- `LoadOrComputeOnce(K, func(V, bool)) (V, bool)`: Load or compute a value only once.
 
 ## Implementation Details
 
