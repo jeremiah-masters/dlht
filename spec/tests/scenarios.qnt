@@ -61,6 +61,16 @@ module scenarios {
     protocol::unchanged_local,
   }
 
+  action invokeLoadOrCompute(p, k, v, save) = all {
+    protocol::pc.get(p) == protocol::PcIdle,
+    protocol::pc' = protocol::pc.set(p, protocol::PcLC1),
+    protocol::op' = protocol::op.set(p, Some(LoadOrCompute)),
+    protocol::arg' = protocol::arg.set(p, Some(LoadComputeArg((k, v, save)))),
+    protocol::ret' = protocol::ret.set(p, None),
+    protocol::unchanged_shared,
+    protocol::unchanged_local,
+  }
+
   action insertSuccess(p, k, v) =
     invokeInsert(p, k, v)
       .then(protocol::I1(p))
@@ -363,6 +373,90 @@ module scenarios {
       .then(protocol::G1("p1"))
       .then(protocol::G2("p1"))
       .expect(retIs("p1", true, Some("v1")))
+
+  // ------------------------ LoadOrCompute scenarios -----------------------
+
+  // Absent key, save=true: commit via Shadow -> Valid.
+  run load_or_compute_absent_save_true =
+    protocol::init
+      .then(invokeLoadOrCompute("p1", "k1", "v1", true))
+      .then(protocol::LC1("p1"))
+      .then(protocol::LC2("p1"))
+      .then(protocol::LC3("p1"))
+      .then(protocol::LC4("p1"))
+      .then(protocol::LC5("p1"))
+      .then(protocol::LC6("p1"))
+      .then(protocol::LC7("p1"))
+      .expect(retIs("p1", false, Some("v1")))
+      .expect(protocol::readVisibleByHeader(protocol::header.get(1), 1, "k1") == Some("v1"))
+
+  // Absent key, save=false: abort via Shadow -> Trying (LC7) -> Invalid (LC9); map unchanged.
+  run load_or_compute_absent_save_false =
+    protocol::init
+      .then(invokeLoadOrCompute("p1", "k1", "v1", false))
+      .then(protocol::LC1("p1"))
+      .then(protocol::LC2("p1"))
+      .then(protocol::LC3("p1"))
+      .then(protocol::LC4("p1"))
+      .then(protocol::LC5("p1"))
+      .then(protocol::LC6("p1"))
+      .then(protocol::LC7("p1"))
+      .expect(protocol::pc.get("p1") == protocol::PcLC9 and protocol::ret.get("p1") == None)
+      .then(protocol::LC9("p1"))
+      .expect(retIs("p1", false, Some("v1")))
+      .expect(protocol::readVisibleByHeader(protocol::header.get(1), 1, "k1") == None)
+
+  // Key already present: LC2 takes the Valid-match return; fn is never reached.
+  run load_or_compute_present_returns_loaded =
+    protocol::init
+      .then(insertSuccess("p1", "k1", "v1"))
+      .then(invokeLoadOrCompute("p1", "k1", "v2", true))
+      .then(protocol::LC1("p1"))
+      .then(protocol::LC2("p1"))
+      .expect(retIs("p1", true, Some("v1")))
+      .expect(protocol::readVisibleByHeader(protocol::header.get(1), 1, "k1") == Some("v1"))
+
+  // p2 sees p1's Shadow and waits until p1 commits.
+  run load_or_compute_concurrent_waits_on_shadow =
+    protocol::init
+      .then(invokeLoadOrCompute("p1", "k1", "v1", true))
+      .then(protocol::LC1("p1"))
+      .then(protocol::LC2("p1"))
+      .then(protocol::LC3("p1"))
+      .then(protocol::LC4("p1"))
+      .then(protocol::LC5("p1"))
+      .expect(protocol::pc.get("p1") == protocol::PcLC6)
+      .then(invokeLoadOrCompute("p2", "k1", "v2", true))
+      .then(protocol::LC1("p2"))
+      .then(protocol::LC2("p2"))
+      .expect(protocol::pc.get("p2") == protocol::PcLC1 and protocol::op.get("p2") == Some(LoadOrCompute) and protocol::ret.get("p2") == None)
+      .then(protocol::LC6("p1"))
+      .then(protocol::LC7("p1"))
+      .expect(retIs("p1", false, Some("v1")))
+      .then(protocol::LC1("p2"))
+      .then(protocol::LC2("p2"))
+      .expect(retIs("p2", true, Some("v1")))
+
+  // Insert backs off when a Shadow holds its key; sees Valid after the commit.
+  run insert_waits_on_shadow =
+    protocol::init
+      .then(invokeLoadOrCompute("p1", "k1", "v1", true))
+      .then(protocol::LC1("p1"))
+      .then(protocol::LC2("p1"))
+      .then(protocol::LC3("p1"))
+      .then(protocol::LC4("p1"))
+      .then(protocol::LC5("p1"))
+      .expect(protocol::pc.get("p1") == protocol::PcLC6)
+      .then(invokeInsert("p2", "k1", "v2"))
+      .then(protocol::I1("p2"))
+      .then(protocol::I2("p2"))
+      .expect(protocol::pc.get("p2") == protocol::PcI1 and protocol::op.get("p2") == Some(Insert) and protocol::ret.get("p2") == None)
+      .then(protocol::LC6("p1"))
+      .then(protocol::LC7("p1"))
+      .expect(retIs("p1", false, Some("v1")))
+      .then(protocol::I1("p2"))
+      .then(protocol::I2("p2"))
+      .expect(retIs("p2", false, Some("v1")))
 
   run multiple_keys_same_bin =
     protocol::init
