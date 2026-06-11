@@ -5,14 +5,14 @@ module scenarios {
     valDomain = Set("v1", "v2"),
   ).* from "../types"
 
-  import protocol(
+  import checked(
     procSet = Set("p1", "p2"),
     keyDomain = Set("k1", "k2"),
     valDomain = Set("v1", "v2"),
     numBins = 1,
     slotsPerBin = 3,
     hash = Map("k1" -> 1, "k2" -> 1),
-  ) as protocol from "../protocol"
+  ) as protocol from "../checked"
 
   def retIs(p, okExpected, valExpected) = {
     match protocol::ret.get(p) {
@@ -178,10 +178,9 @@ module scenarios {
       .then(protocol::I5("p1"))
       .then(protocol::I1("p2"))
       .then(protocol::I2("p2"))
-      .then(protocol::I1("p2"))
-      .then(protocol::I2("p2"))
       .expect(retIs("p2", false, Some("v1")))
       .expect(protocol::visibleSlotsByHeader(protocol::header.get(1), 1, "k1").size() == 1)
+      .expect(protocol::inv)
 
   run concurrent_delete_get_interleaving =
     protocol::init
@@ -201,6 +200,7 @@ module scenarios {
       .expect(protocol::op.get("p1") == Some(Delete) and protocol::pc.get("p1") == protocol::PcD8)
       .then(protocol::D8("p1"))
       .expect(protocol::op.get("p1") == None)
+      .expect(protocol::inv)
 
   run concurrent_put_put_same_key =
     protocol::init
@@ -217,6 +217,7 @@ module scenarios {
       .then(protocol::P7("p2"))
       .expect(retIs("p2", true, Some("v2")))
       .expect(protocol::readVisibleByHeader(protocol::header.get(1), 1, "k1") == Some("v1"))
+      .expect(protocol::inv)
 
   run put_delete_race_same_key =
     protocol::init
@@ -240,6 +241,7 @@ module scenarios {
       .expect(retIs("p2", true, Some("v2")))
       .then(protocol::D8("p2"))
       .expect(protocol::readVisibleByHeader(protocol::header.get(1), 1, "k1") == None)
+      .expect(protocol::inv)
 
   run insert_during_delete_window =
     protocol::init
@@ -259,6 +261,7 @@ module scenarios {
       .then(protocol::G1("p1"))
       .then(protocol::G2("p1"))
       .expect(retIs("p1", true, Some("v2")))
+      .expect(protocol::inv)
 
   run get_during_delete_window =
     protocol::init
@@ -355,6 +358,7 @@ module scenarios {
         protocol::visibleSlotsByHeader(protocol::header.get(1), 1, "k1").size() == 1 and
           protocol::readVisibleByHeader(protocol::header.get(1), 1, "k1") == Some("v2")
       )
+      .expect(protocol::inv)
 
   run get_retries_on_header_change =
     protocol::init
@@ -401,7 +405,9 @@ module scenarios {
       .then(protocol::LC5("p1"))
       .then(protocol::LC6("p1"))
       .then(protocol::LC7("p1"))
-      .expect(protocol::pc.get("p1") == protocol::PcLC9 and protocol::ret.get("p1") == None)
+      // LC7 (save=false) is the linearization point: the result is posted here,
+      // while op stays pending and pc advances to LC9 for cleanup.
+      .expect(protocol::pc.get("p1") == protocol::PcLC9 and retIs("p1", false, Some("v1")))
       .then(protocol::LC9("p1"))
       .expect(retIs("p1", false, Some("v1")))
       .expect(protocol::readVisibleByHeader(protocol::header.get(1), 1, "k1") == None)
@@ -436,6 +442,7 @@ module scenarios {
       .then(protocol::LC1("p2"))
       .then(protocol::LC2("p2"))
       .expect(retIs("p2", true, Some("v1")))
+      .expect(protocol::inv)
 
   // Insert backs off when a Shadow holds its key; sees Valid after the commit.
   run insert_waits_on_shadow =
@@ -457,6 +464,7 @@ module scenarios {
       .then(protocol::I1("p2"))
       .then(protocol::I2("p2"))
       .expect(retIs("p2", false, Some("v1")))
+      .expect(protocol::inv)
 
   run multiple_keys_same_bin =
     protocol::init
@@ -474,4 +482,113 @@ module scenarios {
         protocol::visibleSlotsByHeader(protocol::header.get(1), 1, "k1").size() == 1 and
           protocol::visibleSlotsByHeader(protocol::header.get(1), 1, "k2").size() == 1
       )
+      .expect(protocol::inv)
+
+  // LC8 (unreserve after an LC5 CAS failure): p1 reserves and fills slot 1,
+  // then p2's full insert bumps the bin-1 header twice (I3 reserve + I5
+  // finalize), so p1's LC5 expectedH check fails and p1 must clear its
+  // Trying reservation via LC8 and restart from LC1. fn never ran; ret stays
+  // unset.
+  run lc5_failure_then_lc8_cleanup =
+    protocol::init
+      .then(invokeLoadOrCompute("p1", "k1", "v1", true))
+      .then(protocol::LC1("p1"))
+      .then(protocol::LC2("p1"))
+      .then(protocol::LC3("p1"))
+      .then(protocol::LC4("p1"))
+      .then(insertSuccess("p2", "k2", "v2"))
+      .then(protocol::LC5("p1"))
+      .expect(protocol::pc.get("p1") == protocol::PcLC8 and protocol::ret.get("p1") == None)
+      .then(protocol::LC8("p1"))
+      .expect(
+        protocol::header.get(1).slotState.get(protocol::local.get("p1").targetSlot) == protocol::Invalid and
+          protocol::slotVal.get(1).get(protocol::local.get("p1").targetSlot) == None and
+          protocol::slotTag.get(1).get(protocol::local.get("p1").targetSlot) == None and
+          protocol::ret.get("p1") == None and
+          protocol::pc.get("p1") == protocol::PcLC1
+      )
+      .expect(protocol::inv)
+
+  // D3 absent-return on an empty map: D2 computes targetSlot == 0 (nothing
+  // visible), so D3's keyAbsentGuard fires and Delete returns (false, None).
+  // Exercises the absentReturnConsistent path directly.
+  run delete_absent_fails =
+    protocol::init
+      .then(invokeDelete("p1", "k1"))
+      .then(protocol::D1("p1"))
+      .then(protocol::D2("p1"))
+      .then(protocol::D3("p1"))
+      .expect(retIs("p1", false, None))
+      .expect(protocol::inv)
+
+  // A Shadow slot is invisible to Delete's scan: while p1's compute is in
+  // flight (Shadow published at LC5, commit pending), p2's Delete takes the
+  // D3 absent-return. After p1's LC7 commit, the key is visible to Get.
+  run put_delete_absent_during_shadow =
+    protocol::init
+      .then(invokeLoadOrCompute("p1", "k1", "v1", true))
+      .then(protocol::LC1("p1"))
+      .then(protocol::LC2("p1"))
+      .then(protocol::LC3("p1"))
+      .then(protocol::LC4("p1"))
+      .then(protocol::LC5("p1"))
+      .then(invokeDelete("p2", "k1"))
+      .then(protocol::D1("p2"))
+      .then(protocol::D2("p2"))
+      .then(protocol::D3("p2"))
+      .expect(retIs("p2", false, None))
+      .then(protocol::LC6("p1"))
+      .then(protocol::LC7("p1"))
+      .expect(retIs("p1", false, Some("v1")))
+      .then(invokeGet("p2", "k1"))
+      .then(protocol::G1("p2"))
+      .then(protocol::G2("p2"))
+      .expect(retIs("p2", true, Some("v1")))
+      .expect(protocol::inv)
+
+  // LC7 commit-CAS failure: p2's insert moves the header after p1's LC6
+  // hLoop load, so LC7 bounces back to LC6 (no return posted); the reloaded
+  // hLoop then lets the commit succeed on the retry.
+  run lc7_drift_retries_lc6 =
+    protocol::init
+      .then(invokeLoadOrCompute("p1", "k1", "v1", true))
+      .then(protocol::LC1("p1"))
+      .then(protocol::LC2("p1"))
+      .then(protocol::LC3("p1"))
+      .then(protocol::LC4("p1"))
+      .then(protocol::LC5("p1"))
+      .then(protocol::LC6("p1"))
+      .then(insertSuccess("p2", "k2", "v2"))
+      .then(protocol::LC7("p1"))
+      .expect(protocol::pc.get("p1") == protocol::PcLC6 and protocol::ret.get("p1") == None)
+      .then(protocol::LC6("p1"))
+      .then(protocol::LC7("p1"))
+      .expect(retIs("p1", false, Some("v1")))
+      .expect(protocol::readVisibleByHeader(protocol::header.get(1), 1, "k1") == Some("v1"))
+      .expect(protocol::inv)
+
+  // D5 retry forced by a concurrent delete's D7: p2 scans slot 1 while it is
+  // still visible (D1/D2), p1's D7 then clears val+tag (header-silent), so
+  // p2's D3 header re-check still passes but D5 sees the dead value and
+  // restarts from D1. p1 is left mid-op at PcD8 (the open delete window);
+  // inv must still hold there.
+  run d5_retry_via_delete_window =
+    protocol::init
+      .then(insertSuccess("p1", "k1", "v1"))
+      .then(invokeDelete("p1", "k1"))
+      .then(protocol::D1("p1"))
+      .then(protocol::D2("p1"))
+      .then(protocol::D3("p1"))
+      .then(protocol::D4("p1"))
+      .then(protocol::D5("p1"))
+      .then(protocol::D6("p1"))
+      .then(invokeDelete("p2", "k1"))
+      .then(protocol::D1("p2"))
+      .then(protocol::D2("p2"))
+      .then(protocol::D7("p1"))
+      .then(protocol::D3("p2"))
+      .then(protocol::D4("p2"))
+      .then(protocol::D5("p2"))
+      .expect(protocol::pc.get("p2") == protocol::PcD1)
+      .expect(protocol::inv)
 }

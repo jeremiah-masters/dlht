@@ -18,5 +18,5 @@ coverage.html
 
 .worktrees/
 .tlacache/
-spec/_apalache-out/
+spec/**/_apalache-out/
 states/

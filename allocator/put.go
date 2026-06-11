@@ -77,6 +77,14 @@ retry:
 	}
 
 	// Must revalidate slot using seqlock proceedure
+	//
+	// NOTE: deliberate asymmetry vs Delete's retry loop (delete.go:89-91):
+	// Delete re-checks the header's binState (resize) on every iteration; this
+	// loop does not. Put stays safe during a transfer because resize.go's
+	// transferValidSlots publishes a sentinel into slot.Key (an SC store)
+	// before moving the entry, so this loop's DWCAS fails on the key mismatch
+	// and the curKey check below routes it back to retry. Keep this in mind
+	// when the resize phase of the spec lands.
 	for {
 		hLoop := atomicLoadHeader(&pb.Header)
 		if hLoop.getSlotState(targetIdx) != SlotValid {

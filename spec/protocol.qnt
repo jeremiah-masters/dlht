@@ -46,6 +46,27 @@ module protocol {
 
   var local: PROC -> LocalState
 
+  // Snapshot of the full shared+control state. Pure invariant families take
+  // this instead of reading vars, so the induction anchor (induction.qnt) can
+  // evaluate them on *constructed* candidate states before assignment.
+  type SpecState = {
+    header: BinIdx -> Header,
+    slotKey: BinIdx -> (SlotIdx -> Option[KEY]),
+    slotVal: BinIdx -> (SlotIdx -> Option[VAL]),
+    slotTag: BinIdx -> (SlotIdx -> Option[int]),
+    nextTag: int,
+    pc: PROC -> PC,
+    op: PROC -> Op,
+    arg: PROC -> Option[Arg],
+    ret: PROC -> Option[Res],
+    local: PROC -> LocalState,
+  }
+
+  def currentSpecState: SpecState = {
+    header: header, slotKey: slotKey, slotVal: slotVal, slotTag: slotTag,
+    nextTag: nextTag, pc: pc, op: op, arg: arg, ret: ret, local: local,
+  }
+
   assume numBinsDef = numBins > 0
   assume slotsPerBinDef = slotsPerBin > 0
   assume hashDef = keyDomain.forall(k => binDomain.contains(hash.get(k)))
@@ -57,8 +78,8 @@ module protocol {
     keyDomain.size() > 0 and
     valDomain.size() > 0
 
-  pure val anyKey: KEY = keyDomain.chooseSome()
-  pure val anyVal: VAL = valDomain.chooseSome()
+  pure val anyKey: KEY = pickAny(keyDomain)
+  pure val anyVal: VAL = pickAny(valDomain)
 
   pure val emptyHeader: Header = {
     version: 0,
@@ -146,7 +167,7 @@ module protocol {
     val visible = visibleSlotsByHeaderFrom(h, keyMap, valMap, tagMap, b, k)
     if (visible.size() == 0) None
     else {
-      val s = visible.chooseSome()
+      val s = minOr0(visible)
       valMap.get(b).get(s)
     }
   }
@@ -158,12 +179,8 @@ module protocol {
     readVisibleByHeaderFrom(h, slotKey, slotVal, slotTag, b, k)
 
   def slotForKeyByHeader(h: Header, b: BinIdx, k: KEY): SlotIdx = {
-    val visible = visibleSlotsByHeader(h, b, k)
-    if (visible.size() == 0) 0 else visible.chooseSome()
+    minOr0(visibleSlotsByHeader(h, b, k))
   }
-
-  def concreteState: State =
-    keyDomain.mapBy(k => readVisibleByHeader(header.get(binOf(k)), binOf(k), k))
 
   pure def opFromPC(id: PC): Op = match id {
     | PcIdle => None
@@ -376,7 +393,7 @@ module protocol {
         val free = slotIdx.filter(s => h.slotState.get(s) == Invalid)
         if (free.size() != 0) {
           all {
-            local' = local.set(p, withTargetSlot(local.get(p), free.chooseSome())),
+            local' = local.set(p, withTargetSlot(local.get(p), minOr0(free))),
             pc' = pc.set(p, PcI3),
             ret' = ret,
             op' = op,
@@ -868,7 +885,7 @@ module protocol {
         val free = slotIdx.filter(s => h.slotState.get(s) == Invalid)
         if (free.size() != 0) {
           all {
-            local' = local.set(p, withTargetSlot(local.get(p), free.chooseSome())),
+            local' = local.set(p, withTargetSlot(local.get(p), minOr0(free))),
             pc' = pc.set(p, PcLC3),
             ret' = ret,
             op' = op,
@@ -995,15 +1012,22 @@ module protocol {
             local' = local,
           }
         } else {
-          // Abort phase 1: Shadow -> Trying. Slot is now invisible to L3/I2.5
-          // scans, so LC9 can safely clear slot.Val without exposing a
-          // Shadow-with-nil-entry window to other LoadOrComputes.
+          // Abort phase 1: Shadow -> Trying, and LINEARIZATION POINT for
+          // save=false. The result (false, computed v) is fixed here, not at
+          // the LC9 return: at this step the slot is still Shadow with key k,
+          // so liveKeyUniquePerBin + shadowSlotKeyed guarantee k is absent from
+          // the visible set, which is exactly the abstract precondition for the
+          // "absent, fn ran, not saved" outcome. (Mirrors the save=true commit
+          // above, which also linearizes at LC7.) LC9 is then pure cleanup.
+          // The Shadow -> Trying flip keeps the slot invisible to L3/I2.5 scans,
+          // so LC9 can clear slot.Val without exposing a Shadow-with-nil-entry
+          // window to other LoadOrComputes.
           all {
             header' = header.set(b, updateSlotState(header.get(b), s, Trying)),
             slotVal' = slotVal,
             slotTag' = slotTag,
             nextTag' = nextTag,
-            ret' = ret,
+            ret' = ret.set(p, mkResult(false, Some(v))),
             op' = op,
             arg' = arg,
             pc' = pc.set(p, PcLC9),
@@ -1056,12 +1080,13 @@ module protocol {
     }
   }
 
-  // LC9 is abort phase 2: clear slot.Val/Tag, CAS Trying -> Invalid, return.
-  // The slot transitioned Shadow -> Trying at LC7; while Trying it's invisible
-  // to L3/I2.5 scans, so clearing the entry pointer here cannot be observed.
+  // LC9 is abort phase 2: pure cleanup — clear slot.Val/Tag, CAS Trying ->
+  // Invalid, clear op (the return). The result was already posted to ret at
+  // LC7 (the linearization point), so LC9 does NOT touch ret. The slot
+  // transitioned Shadow -> Trying at LC7; while Trying it's invisible to
+  // L3/I2.5 scans, so clearing the entry pointer here cannot be observed.
   action LC9(p) = {
     val k = keyOfProc(p)
-    val v = valOfProc(p)
     val b = binOf(k)
     val s = local.get(p).targetSlot
     all {
@@ -1082,7 +1107,7 @@ module protocol {
       pc' = pc.set(p, PcIdle),
       op' = op.set(p, None),
       arg' = arg.set(p, None),
-      ret' = ret.set(p, mkResult(false, Some(v))),
+      ret' = ret,
       slotKey' = slotKey,
       nextTag' = nextTag,
       local' = local,
@@ -1346,27 +1371,29 @@ module protocol {
     returnAction,
   }
 
-  def typeOK: bool = {
+  pure def typeOKPure(st: SpecState): bool = {
     binDomain.forall(b =>
       slotIdx.forall(s =>
-        (slotVal.get(b).get(s) == None) iff (slotTag.get(b).get(s) == None)
+        (st.slotVal.get(b).get(s) == None) iff (st.slotTag.get(b).get(s) == None)
       )
     ) and
 
-    binDomain.forall(b => header.get(b).version >= 0) and
-    nextTag >= 1 and
+    binDomain.forall(b => st.header.get(b).version >= 0) and
+    st.nextTag >= 1 and
 
-    procSet.forall(p => op.get(p) == opFromPC(pc.get(p))) and
-    procSet.forall(p => slotIdxExt.contains(local.get(p).targetSlot)) and
-    procSet.forall(p => local.get(p).h0.version >= 0 and local.get(p).hLoop.version >= 0) and
+    procSet.forall(p => st.op.get(p) == opFromPC(st.pc.get(p))) and
+    procSet.forall(p => slotIdxExt.contains(st.local.get(p).targetSlot)) and
+    procSet.forall(p => st.local.get(p).h0.version >= 0 and st.local.get(p).hLoop.version >= 0) and
 
     procSet.forall(p =>
-      if (op.get(p) == None)
-        arg.get(p) == None
-      else match arg.get(p) {
-        | Some(a) => argsOf(op.get(p)).contains(a)
+      if (st.op.get(p) == None)
+        st.arg.get(p) == None
+      else match st.arg.get(p) {
+        | Some(a) => argsOf(st.op.get(p)).contains(a)
         | _ => false
       }
     )
   }
+
+  def typeOK: bool = typeOKPure(currentSpecState)
 }

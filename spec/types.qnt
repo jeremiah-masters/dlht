@@ -26,6 +26,24 @@ module types {
 
   pure val opNames: Set[OpName] = Set(Get, Insert, Put, Delete, LoadOrCompute)
 
+  // Deterministic picks (simulator-safe; chooseSome is unsupported by the
+  // quint evaluator). Both are sound determinizations:
+  //   pickAny – callers (anyKey, anyVal, refinement's singleton proc sets)
+  //             need any representative; element order is irrelevant.
+  //   minOr0  – visible-slot callers pick from a set proven <=1-element by
+  //             liveKeyUniquePerBin (under live-header gating); free-slot
+  //             callers intentionally select the lowest index, matching the
+  //             Go implementation's TrailingZeros choice.
+  pure def pickAny(s: Set[str]): str =
+    s.fold(("", false), (acc, x) => if (acc._2) acc else (x, true))._1
+
+  // Precondition: all elements of s are >= 1 (true for SlotIdx sets, which
+  // are filters of 1.to(slotsPerBin)). Returns 0 for empty — the protocol's
+  // "no slot" sentinel; 0 is never a valid SlotIdx. Do NOT use on sets that
+  // may legitimately contain 0 or negatives (e.g. Int-ranged anchor spaces).
+  pure def minOr0(s: Set[int]): int =
+    s.fold(0, (acc, x) => if (acc == 0 or x < acc) x else acc)
+
   pure def keyArgs: Set[Arg] = keyDomain.map(k => KeyArg(k))
   pure def keyValArgs: Set[Arg] = keyDomain.map(k => valDomain.map(v => KeyValArg((k, v)))).flatten()
   pure def keyValSaveArgs: Set[Arg] =
