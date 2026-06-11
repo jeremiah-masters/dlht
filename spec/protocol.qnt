@@ -938,15 +938,24 @@ module protocol {
     all {
       pc.get(p) == PcLC4,
       // anyVal is a placeholder; LC7 overwrites it with fn's value (or clears it).
-      // IMPLEMENTATION CONTRACT (Go): during the Shadow window the entry
-      // pointer is nil — Shadow ⟹ entry == nil. The real entry is allocated
-      // AFTER fn returns and release-stored at the LC7 commit. Some(anyVal)
-      // here is GHOST STATE: it exists so the slot carries a tag (= pointer
-      // identity) through the window, and liveKeyUniquePerBin's Shadow arm
-      // leans on val != None via ownerSlotFilled (F2). A Go implementation
-      // must therefore derive Shadow-uniqueness from the KEY (slotKey), not
-      // from the entry pointer — there is no pointer to compare while the
-      // entry is nil.
+      // IMPLEMENTATION CONTRACT (Go) — the OWNERSHIP form, not an instant
+      // invariant: (1) at Shadow entry the pointer is nil BY CONSTRUCTION
+      // (reserve requires Invalid, and Invalid => nil per invalidSlotClean);
+      // (2) while Shadow, slot.Val is OWNER-EXCLUSIVE — the same rule that
+      // protects Trying; no other thread may read or act on a non-Valid
+      // slot's .Val; (3) the commit is release-store(entry) THEN CAS
+      // Shadow->Valid, so a transient Shadow-with-entry window physically
+      // exists — unobservable by the ownership rule and harmless by
+      // mechanism (the commit CAS bumps the version, so straddling seqlock
+      // readers retry; a racing DWCAS compares a pointer captured under a
+      // Valid window and fails); (4) abort needs NO cleanup — nothing was
+      // stored — a single CAS Shadow->Invalid suffices. Some(anyVal) here is
+      // GHOST STATE: it exists so the slot carries a tag (= pointer identity)
+      // through the window, and liveKeyUniquePerBin's Shadow arm leans on
+      // val != None via ownerSlotFilled (F2). A Go implementation must
+      // derive Shadow-uniqueness from the KEY (slotKey, written before the
+      // Shadow release-CAS, hence acquire-coherent for waiters), never from
+      // the entry pointer.
       slotKey' = slotKey.set(b, slotKey.get(b).set(s, Some(k))),
       slotVal' = slotVal.set(b, slotVal.get(b).set(s, Some(anyVal))),
       slotTag' = slotTag.set(b, slotTag.get(b).set(s, Some(nextTag))),

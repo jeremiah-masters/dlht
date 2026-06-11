@@ -20,11 +20,19 @@ Key abstractions:
   is modeled exactly.
 - The `Some(anyVal)` a Shadow slot carries through LoadOrCompute's fn window is
   **spec-only ghost state** (it lets the slot bear a tag); the Go contract is
-  `Shadow ⟹ entry == nil` — the entry is allocated after `fn` and
-  release-stored at the LC7 commit, so Shadow-uniqueness must come from the
-  key, not the pointer. The two contract corollaries (at-most-once fn per key,
-  holder exclusivity) are checked in `verify.sh` stage 4 as `inv ⟹ contract`
-  (0-step anchored, 2-proc).
+  the **ownership form**, not an instant invariant: the entry pointer is nil at
+  Shadow entry (by construction: reserve requires Invalid, and Invalid ⟹ nil),
+  stays owner-exclusive through the window (the same rule that protects
+  Trying — no other thread may read a non-Valid slot's `.Val`), and the commit
+  is release-store(entry) **then** CAS Shadow→Valid — the transient
+  Shadow-with-entry window this creates is unobservable by the ownership rule
+  and harmless by mechanism (the commit CAS bumps the seqlock version;
+  a racing DWCAS compares a pointer captured under a Valid window and fails).
+  Abort therefore needs no cleanup (single CAS Shadow→Invalid).
+  Shadow-uniqueness must come from the key, never the pointer. The two
+  contract corollaries (at-most-once fn per key, holder exclusivity) are
+  checked in `verify.sh` stage 4 as `inv ⟹ contract` (0-step anchored,
+  2-proc).
 - Every CAS / seqlock check compares a whole `Header` record
   (`{version, slotState}`), modeling the implementation's full-64-bit header CAS.
 
