@@ -938,6 +938,15 @@ module protocol {
     all {
       pc.get(p) == PcLC4,
       // anyVal is a placeholder; LC7 overwrites it with fn's value (or clears it).
+      // IMPLEMENTATION CONTRACT (Go): during the Shadow window the entry
+      // pointer is nil — Shadow ⟹ entry == nil. The real entry is allocated
+      // AFTER fn returns and release-stored at the LC7 commit. Some(anyVal)
+      // here is GHOST STATE: it exists so the slot carries a tag (= pointer
+      // identity) through the window, and liveKeyUniquePerBin's Shadow arm
+      // leans on val != None via ownerSlotFilled (F2). A Go implementation
+      // must therefore derive Shadow-uniqueness from the KEY (slotKey), not
+      // from the entry pointer — there is no pointer to compare while the
+      // entry is nil.
       slotKey' = slotKey.set(b, slotKey.get(b).set(s, Some(k))),
       slotVal' = slotVal.set(b, slotVal.get(b).set(s, Some(anyVal))),
       slotTag' = slotTag.set(b, slotTag.get(b).set(s, Some(nextTag))),

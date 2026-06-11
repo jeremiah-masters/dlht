@@ -18,6 +18,13 @@ Key abstractions:
   the entry pointer (`None` = nil); `slotTag: Option[int]` + a global `nextTag`
   model entry-pointer **identity**, so Put/Delete's `(hash, ptr)` DWCAS compare
   is modeled exactly.
+- The `Some(anyVal)` a Shadow slot carries through LoadOrCompute's fn window is
+  **spec-only ghost state** (it lets the slot bear a tag); the Go contract is
+  `Shadow ⟹ entry == nil` — the entry is allocated after `fn` and
+  release-stored at the LC7 commit, so Shadow-uniqueness must come from the
+  key, not the pointer. The two contract corollaries (at-most-once fn per key,
+  holder exclusivity) are checked in `verify.sh` stage 4 as `inv ⟹ contract`
+  (0-step anchored, 2-proc).
 - Every CAS / seqlock check compares a whole `Header` record
   (`{version, slotState}`), modeling the implementation's full-64-bit header CAS.
 
