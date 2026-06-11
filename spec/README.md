@@ -28,7 +28,10 @@ Key abstractions:
   Shadow-with-entry window this creates is unobservable by the ownership rule
   and harmless by mechanism (the commit CAS bumps the seqlock version;
   a racing DWCAS compares a pointer captured under a Valid window and fails).
-  Abort therefore needs no cleanup (single CAS Shadow→Invalid).
+  In Go the abort therefore needs no cleanup — a single CAS Shadow→Invalid —
+  whereas the **spec model's** abort is two-phase (LC7 Shadow→Trying posts the
+  result; LC9 clears the ghost val/tag, Trying→Invalid) purely because the
+  ghost placeholder must be cleared.
   Shadow-uniqueness must come from the key, never the pointer. The two
   contract corollaries (at-most-once fn per key, holder exclusivity) are
   checked in `verify.sh` stage 4 as `inv ⟹ contract` (0-step anchored,

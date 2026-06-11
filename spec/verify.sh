@@ -29,10 +29,11 @@ mkdir -p "$APALACHE_OUT_DIR"
 export JVM_ARGS="${JVM_ARGS:--Xmx16384m}"
 
 # Cost tiers. Apalache consecution is expensive and grows fast with the config:
-# 1-proc ~1.5min, 2-proc ~45min, 2-proc-2-key hours. The 1-proc checks always
-# run; the heavier configs are opt-in.
-#   DLHT_VERIFY_2PROC=1  (default) 2-proc base+consecution+refinement (~45min+)
-#   DLHT_VERIFY_2KEY=0   (default) 2-proc-2-key base+consecution (hours) — must
+# 1-proc ~1.5-9min, 2-proc ~45min-2.8h, 2-proc-2-key ~23min-hours (load- and
+# heap-dependent). The 1-proc checks always run; 2-proc is DEFAULT-ON (set
+# DLHT_VERIFY_2PROC=0 for a fast smoke); only the 2-key tier is opt-in.
+#   DLHT_VERIFY_2PROC=1  (default ON)  2-proc base+consecution+refinement+corollaries
+#   DLHT_VERIFY_2KEY=0   (default OFF) 2-proc-2-key base+consecution — must
 #                        pass when enabled; run it before claiming full assurance.
 DLHT_VERIFY_2PROC="${DLHT_VERIFY_2PROC:-1}"
 DLHT_VERIFY_2KEY="${DLHT_VERIFY_2KEY:-0}"

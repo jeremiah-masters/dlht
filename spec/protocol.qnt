@@ -835,8 +835,14 @@ module protocol {
 
   // --------------------------- LoadOrCompute ------------------------------
   // Mirrors Insert; publishes to Shadow at LC5, runs fn while in Shadow, then
-  // commits (Shadow -> Valid with fn's value) or aborts (Shadow -> Invalid)
-  // at LC7.
+  // commits (Shadow -> Valid with fn's value) at LC7, or aborts via a
+  // TWO-PHASE path: LC7 posts the result and moves Shadow -> Trying (the
+  // abort's linearization point), LC9 clears the ghost val/tag and moves
+  // Trying -> Invalid. The two phases exist only because of the spec's
+  // anyVal ghost placeholder (there is ghost state to clear); the Go
+  // implementation keeps the entry nil through the window, has nothing to
+  // clear, and aborts with a SINGLE CAS Shadow -> Invalid (see LC4's
+  // implementation-contract comment).
 
   action LC1(p) = {
     val k = keyOfProc(p)
@@ -948,8 +954,10 @@ module protocol {
       // exists — unobservable by the ownership rule and harmless by
       // mechanism (the commit CAS bumps the version, so straddling seqlock
       // readers retry; a racing DWCAS compares a pointer captured under a
-      // Valid window and fails); (4) abort needs NO cleanup — nothing was
-      // stored — a single CAS Shadow->Invalid suffices. Some(anyVal) here is
+      // Valid window and fails); (4) in GO the abort needs no cleanup —
+      // nothing was stored — a single CAS Shadow->Invalid suffices (the
+      // SPEC's abort is two-phase, LC7 Shadow->Trying + LC9 cleanup, only
+      // because this ghost placeholder must be cleared). Some(anyVal) here is
       // GHOST STATE: it exists so the slot carries a tag (= pointer identity)
       // through the window, and liveKeyUniquePerBin's Shadow arm leans on
       // val != None via ownerSlotFilled (F2). A Go implementation must
