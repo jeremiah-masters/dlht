@@ -2,6 +2,7 @@ package adapters
 
 import (
 	"cmp"
+	"sync"
 	"unsafe"
 
 	"github.com/alphadose/haxmap"
@@ -13,7 +14,8 @@ type haxmapHashable interface {
 }
 
 type haxMapAdapter[K haxmapHashable, V any] struct {
-	m *haxmap.Map[K, V]
+	m         *haxmap.Map[K, V]
+	computeMu sync.Mutex
 }
 
 func NewHaxMapAdapter[K haxmapHashable, V any](capacity int) MapAdapter[K, V] {
@@ -45,6 +47,41 @@ func (a *haxMapAdapter[K, V]) Range(yield func(K, V) bool) {
 	a.m.ForEach(func(k K, v V) bool {
 		return yield(k, v)
 	})
+}
+
+func (a *haxMapAdapter[K, V]) LoadOrCompute(key K, fn func() (V, bool)) (V, bool) {
+	if v, ok := a.m.Get(key); ok {
+		return v, true
+	}
+	val, save := fn()
+	if !save {
+		return val, false
+	}
+	actual, loaded := a.m.GetOrSet(key, val)
+	if loaded {
+		return actual, true
+	}
+	return val, false
+}
+
+func (a *haxMapAdapter[K, V]) LoadOrComputeOnce(key K, fn func() (V, bool)) (V, bool) {
+	if v, ok := a.m.Get(key); ok {
+		return v, true
+	}
+	a.computeMu.Lock()
+	defer a.computeMu.Unlock()
+	if v, ok := a.m.Get(key); ok {
+		return v, true
+	}
+	val, save := fn()
+	if !save {
+		return val, false
+	}
+	actual, loaded := a.m.GetOrSet(key, val)
+	if loaded {
+		return actual, true
+	}
+	return val, false
 }
 
 func (a *haxMapAdapter[K, V]) Size() int { return int(a.m.Len()) }

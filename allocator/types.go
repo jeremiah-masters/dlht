@@ -82,6 +82,7 @@ type Map[K Key, V any] struct {
 	hashConfig HashConfig
 	_          [cpu.CacheLineSize - 16]byte // 16 = 8 + 8 (active pointer + hash config)
 	resizeCtx  atomic.Pointer[resizeContext[K, V]]
+	compute    atomic.Pointer[Map[K, chan struct{}]]
 }
 
 type Options struct {

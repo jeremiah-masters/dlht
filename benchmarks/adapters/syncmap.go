@@ -3,7 +3,8 @@ package adapters
 import "sync"
 
 type syncMapAdapter[K comparable, V any] struct {
-	m sync.Map
+	m         sync.Map
+	computeMu sync.Mutex
 }
 
 func NewSyncMapAdapter[K comparable, V any]() MapAdapter[K, V] {
@@ -48,6 +49,41 @@ func (a *syncMapAdapter[K, V]) Range(yield func(K, V) bool) {
 	a.m.Range(func(k, v any) bool {
 		return yield(k.(K), v.(V))
 	})
+}
+
+func (a *syncMapAdapter[K, V]) LoadOrCompute(key K, fn func() (V, bool)) (V, bool) {
+	if v, ok := a.m.Load(key); ok {
+		return v.(V), true
+	}
+	val, save := fn()
+	if !save {
+		return val, false
+	}
+	actual, loaded := a.m.LoadOrStore(key, val)
+	if loaded {
+		return actual.(V), true
+	}
+	return val, false
+}
+
+func (a *syncMapAdapter[K, V]) LoadOrComputeOnce(key K, fn func() (V, bool)) (V, bool) {
+	if v, ok := a.m.Load(key); ok {
+		return v.(V), true
+	}
+	a.computeMu.Lock()
+	defer a.computeMu.Unlock()
+	if v, ok := a.m.Load(key); ok {
+		return v.(V), true
+	}
+	val, save := fn()
+	if !save {
+		return val, false
+	}
+	actual, loaded := a.m.LoadOrStore(key, val)
+	if loaded {
+		return actual.(V), true
+	}
+	return val, false
 }
 
 func (a *syncMapAdapter[K, V]) Close() {}

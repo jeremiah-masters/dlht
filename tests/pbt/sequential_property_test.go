@@ -71,6 +71,21 @@ func runSequentialModelCheck[K dlht.Key](t *rapid.T, keyGen *rapid.Generator[K])
 						o.Key, ok, deleted, zero)
 				}
 			}
+		case OpLoadOrCompute:
+			mv, existed := model[o.Key]
+			v, loaded := m.LoadOrCompute(o.Key, func() (int, bool) { return o.Value, true })
+			if existed {
+				if !loaded || v != mv {
+					t.Fatalf("loadOrCompute mismatch key=%v existed=true loaded=%v val=%v model=%v",
+						o.Key, loaded, v, mv)
+				}
+			} else {
+				if loaded || v != o.Value {
+					t.Fatalf("loadOrCompute mismatch key=%v existed=false loaded=%v val=%v expected=%v",
+						o.Key, loaded, v, o.Value)
+				}
+				model[o.Key] = o.Value
+			}
 		}
 	}
 }

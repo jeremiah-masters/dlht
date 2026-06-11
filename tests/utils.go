@@ -20,6 +20,8 @@ const (
 	OpInsert
 	OpPut
 	OpDelete
+	OpLoadOrCompute
+	OpLoadOrComputeOnce
 )
 
 type DLHTInput struct {
@@ -44,6 +46,10 @@ func (input DLHTInput) String() string {
 		return fmt.Sprintf("Put(%s, %d)", input.Key, input.Value)
 	case OpDelete:
 		return fmt.Sprintf("Delete(%s)", input.Key)
+	case OpLoadOrCompute:
+		return fmt.Sprintf("LoadOrCompute(%s, fn→%d)", input.Key, input.Value)
+	case OpLoadOrComputeOnce:
+		return fmt.Sprintf("LoadOrComputeOnce(%s, fn→%d)", input.Key, input.Value)
 	default:
 		return fmt.Sprintf("Unknown(%d)", input.Op)
 	}
@@ -102,6 +108,14 @@ var DLHTModel = porcupine.Model{
 				return false, st
 			}
 			return !out.Found && out.Value == 0, st
+		case OpLoadOrCompute, OpLoadOrComputeOnce:
+			if st.Exists {
+				return out.Found && out.Value == st.Value && !out.Updated, st
+			}
+			if !out.Found && out.Value == inp.Value && !out.Updated {
+				return true, PerKeyState{Exists: true, Value: inp.Value}
+			}
+			return false, st
 		default:
 			return false, st
 		}
@@ -137,6 +151,16 @@ var DLHTModel = porcupine.Model{
 				return fmt.Sprintf("Delete(%s) -> deleted (was %d)", inp.Key, out.Value)
 			}
 			return fmt.Sprintf("Delete(%s) -> not found", inp.Key)
+		case OpLoadOrCompute:
+			if out.Found {
+				return fmt.Sprintf("LoadOrCompute(%s, fn→%d) -> loaded %d", inp.Key, inp.Value, out.Value)
+			}
+			return fmt.Sprintf("LoadOrCompute(%s, fn→%d) -> computed", inp.Key, inp.Value)
+		case OpLoadOrComputeOnce:
+			if out.Found {
+				return fmt.Sprintf("LoadOrComputeOnce(%s, fn→%d) -> loaded %d", inp.Key, inp.Value, out.Value)
+			}
+			return fmt.Sprintf("LoadOrComputeOnce(%s, fn→%d) -> computed", inp.Key, inp.Value)
 		default:
 			return "Unknown operation"
 		}
@@ -202,6 +226,12 @@ func ExecuteOperation(m *dlht.Map[string, int], input DLHTInput) DLHTOutput {
 	case OpDelete:
 		deletedValue, deleted := m.Delete(input.Key)
 		return DLHTOutput{Found: deleted, Value: deletedValue, Updated: false}
+	case OpLoadOrCompute:
+		value, loaded := m.LoadOrCompute(input.Key, func() (int, bool) { return input.Value, true })
+		return DLHTOutput{Found: loaded, Value: value, Updated: false}
+	case OpLoadOrComputeOnce:
+		value, loaded := m.LoadOrComputeOnce(input.Key, func() (int, bool) { return input.Value, true })
+		return DLHTOutput{Found: loaded, Value: value, Updated: false}
 	default:
 		return DLHTOutput{Found: false, Value: 0, Updated: false}
 	}
@@ -241,6 +271,10 @@ func selectOperation(distribution []float64, key string, value int) DLHTInput {
 				return DLHTInput{OpPut, key, value}
 			case 3:
 				return DLHTInput{OpDelete, key, 0}
+			case 4:
+				return DLHTInput{OpLoadOrCompute, key, value}
+			case 5:
+				return DLHTInput{OpLoadOrComputeOnce, key, value}
 			}
 		}
 	}

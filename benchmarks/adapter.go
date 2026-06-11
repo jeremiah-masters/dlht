@@ -10,6 +10,8 @@ type MapAdapter[K comparable, V any] interface {
 	Insert(key K, value V) bool // insert-if-absent; true if inserted (key was new)
 	Delete(key K) bool          // true if deleted (key existed)
 	Put(key K, value V) bool    // update-if-exists; true if updated (key existed)
+	LoadOrCompute(key K, fn func() (V, bool)) (V, bool)
+	LoadOrComputeOnce(key K, fn func() (V, bool)) (V, bool)
 	Range(yield func(K, V) bool)
 	Size() int
 	Close()

@@ -23,7 +23,7 @@ func TestOpStreamMixRatios(t *testing.T) {
 			sampler := func(r *rand.Rand, n int) int { return r.IntN(n) }
 			ops := BuildOpStream(s, 100_000, 10_000, rng, sampler)
 
-			counts := [4]int{}
+			counts := [6]int{}
 			for _, op := range ops {
 				counts[op.Type]++
 			}
@@ -32,14 +32,22 @@ func TestOpStreamMixRatios(t *testing.T) {
 			assertClose(t, float64(counts[OpInsert])/total, s.InsertPct, 0.02, "InsertPct")
 			assertClose(t, float64(counts[OpDelete])/total, s.DeletePct, 0.02, "DeletePct")
 			assertClose(t, float64(counts[OpPut])/total, s.PutPct, 0.02, "PutPct")
+			assertClose(t, float64(counts[OpLoadOrCompute])/total, s.LoadOrComputePct, 0.02, "LoadOrComputePct")
+			assertClose(t, float64(counts[OpLoadOrComputeOnce])/total, s.LoadOrComputeOncePct, 0.02, "LoadOrComputeOncePct")
 		})
 	}
 }
 
 func TestOpStreamHotKey(t *testing.T) {
-	s := Scenarios[len(Scenarios)-1] // HotKey is last
+	var s WorkloadDef
+	for _, sc := range Scenarios {
+		if sc.HotKeyMode {
+			s = sc
+			break
+		}
+	}
 	if !s.HotKeyMode {
-		t.Fatal("expected HotKey scenario to be last")
+		t.Fatal("no HotKey scenario found")
 	}
 	rng := rand.New(rand.NewPCG(42, 0))
 	sampler := func(r *rand.Rand, n int) int { return r.IntN(n) }
@@ -53,7 +61,7 @@ func TestOpStreamHotKey(t *testing.T) {
 
 func TestScenariosMixSumsToOne(t *testing.T) {
 	for _, s := range Scenarios {
-		sum := s.GetPct + s.InsertPct + s.DeletePct + s.PutPct
+		sum := s.GetPct + s.InsertPct + s.DeletePct + s.PutPct + s.LoadOrComputePct + s.LoadOrComputeOncePct
 		if math.Abs(sum-1.0) > 0.001 {
 			t.Errorf("scenario %s: op percentages sum to %.3f, want 1.0", s.Name, sum)
 		}

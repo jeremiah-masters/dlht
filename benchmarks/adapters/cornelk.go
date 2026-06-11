@@ -1,6 +1,10 @@
 package adapters
 
-import "github.com/cornelk/hashmap"
+import (
+	"sync"
+
+	"github.com/cornelk/hashmap"
+)
 
 // cornelkHashable mirrors the unexported hashable constraint from cornelk/hashmap.
 type cornelkHashable interface {
@@ -8,7 +12,8 @@ type cornelkHashable interface {
 }
 
 type cornelkAdapter[K cornelkHashable, V any] struct {
-	m *hashmap.Map[K, V]
+	m         *hashmap.Map[K, V]
+	computeMu sync.Mutex
 }
 
 func NewCornelkAdapter[K cornelkHashable, V any](capacity int) MapAdapter[K, V] {
@@ -36,6 +41,39 @@ func (a *cornelkAdapter[K, V]) Put(key K, val V) bool {
 
 func (a *cornelkAdapter[K, V]) Range(yield func(K, V) bool) {
 	a.m.Range(yield)
+}
+
+func (a *cornelkAdapter[K, V]) LoadOrCompute(key K, fn func() (V, bool)) (V, bool) {
+	if v, ok := a.m.Get(key); ok {
+		return v, true
+	}
+	val, save := fn()
+	if !save {
+		return val, false
+	}
+	if actual, loaded := a.m.GetOrInsert(key, val); loaded {
+		return actual, true
+	}
+	return val, false
+}
+
+func (a *cornelkAdapter[K, V]) LoadOrComputeOnce(key K, fn func() (V, bool)) (V, bool) {
+	if v, ok := a.m.Get(key); ok {
+		return v, true
+	}
+	a.computeMu.Lock()
+	defer a.computeMu.Unlock()
+	if v, ok := a.m.Get(key); ok {
+		return v, true
+	}
+	val, save := fn()
+	if !save {
+		return val, false
+	}
+	if actual, loaded := a.m.GetOrInsert(key, val); loaded {
+		return actual, true
+	}
+	return val, false
 }
 
 func (a *cornelkAdapter[K, V]) Size() int { return a.m.Len() }
