@@ -48,7 +48,7 @@ REFINE_INIT_STEPS_1PROC="${REFINE_INIT_STEPS_1PROC:-12}"
 REFINE_INIT_STEPS_2PROC="${REFINE_INIT_STEPS_2PROC:-6}"
 # Number of scenario run-definitions expected (snake_case names; --match '_.*_'
 # selects exactly these and excludes the single-underscore unchanged_* actions).
-SCENARIO_COUNT="${SCENARIO_COUNT:-29}"
+SCENARIO_COUNT="${SCENARIO_COUNT:-32}"
 SCENARIO_2BIN_COUNT="${SCENARIO_2BIN_COUNT:-3}"
 
 verify() { OUT_DIR="$APALACHE_OUT_DIR" quint verify "$@" --verbosity=0; }

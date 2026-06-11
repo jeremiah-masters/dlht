@@ -591,4 +591,142 @@ module scenarios {
       .then(protocol::D5("p2"))
       .expect(protocol::pc.get("p2") == protocol::PcD1)
       .expect(protocol::inv)
+
+  // --------------------- LoadOrCompute contract scenarios -----------------
+  // Companions to the contract corollaries in invariants.qnt
+  // (contractAtMostOneComputePerKey / contractHolderExclusive): the corollary
+  // checks prove the fn window (PcLC6/PcLC7) is exclusive per key over ALL
+  // inv-states; these scenarios pin the intended behavior at its boundaries.
+
+  // Post-abort handoff: the SECOND compute may legitimately run after the
+  // first resolves. p1 (save=false) holds the Shadow; p2 waits at LC2; p1
+  // aborts (LC7 posts ret, LC9 frees slot 1); p2 then acquires Shadow itself
+  // and commits v2. At-most-once-per-key is about CONCURRENT fn runs —
+  // sequential re-execution after an abort is the contract working as
+  // intended.
+  run lc_abort_handoff_second_compute_runs =
+    protocol::init
+      .then(invokeLoadOrCompute("p1", "k1", "v1", false))
+      .then(protocol::LC1("p1"))
+      .then(protocol::LC2("p1"))
+      .then(protocol::LC3("p1"))
+      .then(protocol::LC4("p1"))
+      .then(protocol::LC5("p1"))
+      .expect(protocol::pc.get("p1") == protocol::PcLC6)
+      .then(invokeLoadOrCompute("p2", "k1", "v2", true))
+      .then(protocol::LC1("p2"))
+      .then(protocol::LC2("p2"))
+      // p2 sees p1's Shadow on k1 and backs off to LC1 (no slot picked).
+      .expect(protocol::pc.get("p2") == protocol::PcLC1 and protocol::ret.get("p2") == None)
+      .then(protocol::LC6("p1"))
+      .then(protocol::LC7("p1"))
+      // save=false abort phase 1: ret posted at LC7 (linearization point),
+      // slot 1 Shadow -> Trying, cleanup pending at PcLC9.
+      .expect(protocol::pc.get("p1") == protocol::PcLC9 and retIs("p1", false, Some("v1")))
+      .then(protocol::LC9("p1"))
+      .expect(protocol::header.get(1).slotState.get(1) == protocol::Invalid)
+      .then(protocol::LC1("p2"))
+      .then(protocol::LC2("p2"))
+      .then(protocol::LC3("p2"))
+      .then(protocol::LC4("p2"))
+      .then(protocol::LC5("p2"))
+      .then(protocol::LC6("p2"))
+      .then(protocol::LC7("p2"))
+      .expect(retIs("p1", false, Some("v1")))
+      .expect(retIs("p2", false, Some("v2")))
+      .expect(protocol::readVisibleByHeader(protocol::header.get(1), 1, "k1") == Some("v2"))
+      .expect(protocol::inv)
+
+  // Invocation overlap is NOT fn overlap: p1 (save=false) is parked at PcLC9
+  // (resolved-but-not-returned — ret was posted at LC7, which also flipped
+  // its slot Shadow -> Trying). A second same-key compute may enter the fn
+  // window WHILE p1 still sits there: p2's LC2 sees neither a visible nor a
+  // Shadow slot for k1 (slot 1 is Trying), so the free-slot pick skips the
+  // Trying slot 1 and takes slot 2 (minOr0 of {2,3}). This is exactly why the
+  // corollary's window is {PcLC6,PcLC7} and NOT {..,PcLC9} — widening it is
+  // the recorded [violation] negative control.
+  run lc9_window_second_compute_overlaps =
+    protocol::init
+      .then(invokeLoadOrCompute("p1", "k1", "v1", false))
+      .then(protocol::LC1("p1"))
+      .then(protocol::LC2("p1"))
+      .then(protocol::LC3("p1"))
+      .then(protocol::LC4("p1"))
+      .then(protocol::LC5("p1"))
+      .then(protocol::LC6("p1"))
+      .then(protocol::LC7("p1"))
+      .expect(protocol::pc.get("p1") == protocol::PcLC9 and retIs("p1", false, Some("v1")))
+      .then(invokeLoadOrCompute("p2", "k1", "v2", true))
+      .then(protocol::LC1("p2"))
+      .then(protocol::LC2("p2"))
+      .expect(protocol::local.get("p2").targetSlot == 2)
+      .then(protocol::LC3("p2"))
+      .then(protocol::LC4("p2"))
+      .then(protocol::LC5("p2"))
+      // The overlap window: p2 holds Shadow (slot 2) while p1 is still at
+      // PcLC9 with its aborted claim (slot 1, Trying).
+      .expect(
+        protocol::pc.get("p1") == protocol::PcLC9 and
+          protocol::pc.get("p2") == protocol::PcLC6 and
+          protocol::header.get(1).slotState.get(1) == protocol::Trying and
+          protocol::header.get(1).slotState.get(2) == protocol::Shadow
+      )
+      .then(protocol::LC9("p1"))
+      .then(protocol::LC6("p2"))
+      .then(protocol::LC7("p2"))
+      .expect(retIs("p1", false, Some("v1")))
+      .expect(retIs("p2", false, Some("v2")))
+      .expect(protocol::readVisibleByHeader(protocol::header.get(1), 1, "k1") == Some("v2"))
+      .expect(protocol::inv)
+
+  // The ONE header write that changes bits without bumping the version (D8's
+  // clearSlotState) must still defeat LC7's commit CAS: p1's LC6 captures
+  // hLoop with k2's slot 1 still Valid; p2's D7 (header-silent val/tag clear)
+  // then D8 (Valid -> Invalid, version UNCHANGED) flip the slot state under
+  // the same version; p1's LC7 compares the whole header RECORD, so it
+  // catches the drift (slotState differs though version is equal), bounces to
+  // LC6 without returning, reloads, and commits on the retry.
+  run lc7_drift_via_d8_version_silent_clear =
+    protocol::init
+      .then(insertSuccess("p1", "k2", "v2"))
+      .then(invokeLoadOrCompute("p1", "k1", "v1", true))
+      .then(protocol::LC1("p1"))
+      .then(protocol::LC2("p1"))
+      .then(protocol::LC3("p1"))
+      .then(protocol::LC4("p1"))
+      .then(protocol::LC5("p1"))
+      // p1 holds Shadow on slot 2 (slot 1 is k2's Valid entry).
+      .expect(protocol::pc.get("p1") == protocol::PcLC6 and protocol::header.get(1).slotState.get(2) == protocol::Shadow)
+      .then(invokeDelete("p2", "k2"))
+      .then(protocol::D1("p2"))
+      .then(protocol::D2("p2"))
+      .then(protocol::D3("p2"))
+      .then(protocol::D4("p2"))
+      .then(protocol::D5("p2"))
+      .then(protocol::D6("p2"))
+      .then(protocol::D7("p2"))
+      // D7 cleared slot 1's val/tag fully header-silently: still Valid, version 4.
+      .expect(
+        protocol::pc.get("p2") == protocol::PcD8 and
+          protocol::header.get(1).version == 4 and
+          protocol::header.get(1).slotState.get(1) == protocol::Valid
+      )
+      .then(protocol::LC6("p1"))
+      .then(protocol::D8("p2"))
+      // D8's AND: slot 1 Valid -> Invalid with NO version bump.
+      .expect(
+        protocol::header.get(1).version == 4 and
+          protocol::header.get(1).slotState.get(1) == protocol::Invalid
+      )
+      .then(protocol::LC7("p1"))
+      // lc7SuccessGuard compares the whole header record against hLoop:
+      // versions agree (4 == 4) but slot 1's state differs -> drift bounce,
+      // no return posted.
+      .expect(protocol::pc.get("p1") == protocol::PcLC6 and protocol::ret.get("p1") == None)
+      .then(protocol::LC6("p1"))
+      .then(protocol::LC7("p1"))
+      .expect(retIs("p1", false, Some("v1")))
+      .expect(protocol::readVisibleByHeader(protocol::header.get(1), 1, "k1") == Some("v1"))
+      .expect(retIs("p2", true, Some("v2")))
+      .expect(protocol::inv)
 }

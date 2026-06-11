@@ -55,9 +55,10 @@ Key abstractions:
    samples) check `typeOK` and `inv` on reachable states — the cheap
    "reachable direction" that guards against over-strengthening.
 
-4. **Directed scenarios** (`tests/scenarios.qnt`): 29 hand-written interleavings
+4. **Directed scenarios** (`tests/scenarios.qnt`): 32 hand-written interleavings
    (contention, delete-window, shadow hand-off, multi-key, LC5/LC7 CAS-failure
-   cleanup), 14 of which also assert `inv` in their final state. A separate
+   cleanup, LC abort handoff / LC9-window overlap / D8 version-silent drift),
+   17 of which also assert `inv` in their final state. A separate
    `tests/scenarios_2bin.qnt` (3 runs) re-instantiates the protocol at
    `numBins = 2` to exercise cross-bin isolation, which is vacuous at 1 bin.
 
@@ -159,12 +160,12 @@ Full-suite wall time (observed, per stage, this machine):
 
 ## A quint gotcha worth knowing
 
-`quint test tests/scenarios.qnt` (a bare invocation) runs **zero** of the 29
+`quint test tests/scenarios.qnt` (a bare invocation) runs **zero** of the 32
 scenarios: quint's default test selection only runs `run` definitions whose
 *name* matches a "test" pattern, and the scenarios are descriptively named.
 `verify.sh` uses `--match '_.*_'` (selects exactly the snake_case scenario runs,
 excludes the single-underscore `unchanged_*` protocol actions) and asserts the
-exact counts (`29 passing`, and `3 passing` for `tests/scenarios_2bin.qnt`) so
+exact counts (`32 passing`, and `3 passing` for `tests/scenarios_2bin.qnt`) so
 coverage cannot silently shrink.
 
 ## Toolchain
