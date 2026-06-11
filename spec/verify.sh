@@ -82,6 +82,12 @@ if [[ "$DLHT_VERIFY_2PROC" == "1" ]]; then
   echo "  [2-proc] base + consecution (~45min)"
   verify verify/invariants_2proc.qnt --invariant=inv --max-steps=0
   verify verify/induction_2proc.qnt --invariant=inv --max-steps=1
+  # Contract corollaries (invariants.qnt): NOT invPure conjuncts — checked as
+  # inv => corollary. 0-step from indInit covers ALL inv-states; 2-proc is the
+  # meaningful config (at 1-proc at-most-once-per-key is trivially true).
+  echo "  [2-proc] contract corollaries (inv => contract, 0-step)"
+  verify verify/induction_2proc.qnt --invariant=f_contractAtMostOneComputePerKey --max-steps=0
+  verify verify/induction_2proc.qnt --invariant=f_contractHolderExclusive --max-steps=0
 else
   echo "  [2-proc] SKIPPED (DLHT_VERIFY_2PROC=0)"
 fi

@@ -145,4 +145,11 @@ module induction {
   def f_snapStateAgrees = snapStateAgrees
   def f_freshReservationEmpty = freshReservationEmpty
   def f_absentReturnConsistent = absentReturnConsistent
+
+  // Contract corollaries (NOT invPure conjuncts): checked as inv ⟹ corollary
+  // with `--invariant=f_contract* --max-steps=0` — indInit guards with the
+  // UNCHANGED invPure, so a 0-step run evaluates the corollary over all
+  // inv-states. Wired in verify.sh stage 4 (2-proc tier).
+  def f_contractAtMostOneComputePerKey = contractAtMostOneComputePerKey
+  def f_contractHolderExclusive = contractHolderExclusive
 }

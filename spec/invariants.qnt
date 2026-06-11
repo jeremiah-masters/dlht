@@ -610,6 +610,79 @@ module invariants {
       )
     })
 
+  // ======================= CONTRACT COROLLARIES ===========================
+  // LoadOrCompute CONTRACT properties, machine-checked as
+  //     inv ⟹ corollary
+  // by a 0-step Apalache run from the induction anchor (indInit guards every
+  // candidate with invPure, so `--max-steps=0` evaluates the corollary over
+  // ALL inv-states, not just reachable ones):
+  //     quint verify verify/induction_2proc.qnt \
+  //       --invariant=f_contractAtMostOneComputePerKey --max-steps=0
+  // (wired in verify.sh stage 4, DLHT_VERIFY_2PROC tier; 2-proc is the right
+  // config — at 1-proc the at-most-once property is trivially true).
+  // These are deliberately NOT conjuncts of invPure: each is already IMPLIED
+  // by inv, so conjoining them would change the induction anchor and force a
+  // full re-verification of every consecution + anchored-refinement run for
+  // zero added strength. Keep them out of invPure.
+
+  // Contract clause: AT-MOST-ONCE fn EXECUTION per key. The fn-execution
+  // window is PcLC6/PcLC7 — from LC5's Shadow publish to LC7's commit/abort
+  // resolution; the modeled fn runs exactly once inside it. At most one proc
+  // per key occupies that window at any instant, so fn never runs twice
+  // concurrently for one key (a SECOND compute may legitimately run after an
+  // abort resolves — see scenario lc_abort_handoff_second_compute_runs — and
+  // may overlap the aborter's PcLC9 cleanup, which is outside the window:
+  // invocation overlap is not fn overlap, scenario
+  // lc9_window_second_compute_overlaps).
+  // WHY a corollary check, not an invPure conjunct: implied by inv —
+  // ownerSlotStateConsistent + ownerSlotFilled put each window proc on a
+  // Shadow slot keyed (and placeholder-val-filled) with its own key, so two
+  // same-key window procs would mean either two val-bearing Shadow slots
+  // sharing a key (banned by liveKeyUniquePerBin) or two owners of one Shadow
+  // slot (banned by shadowOwnedUnique).
+  pure def contractAtMostOneComputePerKeyPure(st: SpecState): bool =
+    procSet.forall(p =>
+      procSet.forall(q =>
+        (
+          st.op.get(p) == Some(LoadOrCompute) and
+            Set(PcLC6, PcLC7).contains(st.pc.get(p)) and
+            st.op.get(q) == Some(LoadOrCompute) and
+            Set(PcLC6, PcLC7).contains(st.pc.get(q)) and
+            keyOfProcIn(st, p) == keyOfProcIn(st, q)
+        ).implies(p == q)
+      )
+    )
+
+  // Contract clause: HOLDER EXCLUSIVITY (guaranteed commit). While a proc is
+  // in the fn window (PcLC6/PcLC7) its claim is intact — it still holds its
+  // Shadow slot (in range, state Shadow, keyed with its k) — and k is still
+  // UNCOMMITTED: the bin's visible set for k is empty (same idiom as
+  // absentReturnConsistent). Nothing can publish k behind the holder's back,
+  // so the holder's LC7 resolution is the unique next visibility event for k
+  // and a save=true commit cannot collide with an existing visible entry.
+  // WHY a corollary check, not an invPure conjunct: implied by inv —
+  // ownerSlotStateConsistent/ownerSlotFilled give the Shadow + keyed +
+  // val-bearing slot; any visible slot for k would be a Valid, val-bearing,
+  // k-keyed slot coexisting with it, which liveKeyUniquePerBin forbids (the
+  // two slots would have to coincide, but Valid != Shadow). Adding it to
+  // invPure would change the anchor and force full re-verification for no
+  // strengthening.
+  pure def contractHolderExclusivePure(st: SpecState): bool =
+    procSet.forall(p => {
+      val k = keyOfProcIn(st, p)
+      val b = binOf(k)
+      val s = st.local.get(p).targetSlot
+      val inFnWindow =
+        st.op.get(p) == Some(LoadOrCompute) and
+          Set(PcLC6, PcLC7).contains(st.pc.get(p))
+      inFnWindow.implies(
+        slotIdx.contains(s) and
+        st.header.get(b).slotState.get(s) == Shadow and
+        st.slotKey.get(b).get(s) == Some(k) and
+        visibleSlotsByHeaderFrom(st.header.get(b), st.slotKey, st.slotVal, st.slotTag, b, k).size() == 0
+      )
+    })
+
   // Live wrappers: each family is individually checkable via
   // --invariant=<name> for counterexample localization (inv-group splitting).
   def visibleSlotsWellFormed = visibleSlotsWellFormedPure(currentSpecState)
@@ -639,6 +712,11 @@ module invariants {
   def snapStateAgrees = snapStateAgreesPure(currentSpecState)
   def freshReservationEmpty = freshReservationEmptyPure(currentSpecState)
   def absentReturnConsistent = absentReturnConsistentPure(currentSpecState)
+
+  // Contract-corollary wrappers (checked standalone as inv ⟹ corollary in
+  // verify.sh stage 4; NOT part of inv/invPure — see the section above).
+  def contractAtMostOneComputePerKey = contractAtMostOneComputePerKeyPure(currentSpecState)
+  def contractHolderExclusive = contractHolderExclusivePure(currentSpecState)
 
   // The combined inductive candidate — the anchor guard for induction.qnt.
   // Note: typeOKPure is defined in protocol.qnt (it owns the vars and the
