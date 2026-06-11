@@ -51,7 +51,58 @@ REFINE_INIT_STEPS_2PROC="${REFINE_INIT_STEPS_2PROC:-6}"
 SCENARIO_COUNT="${SCENARIO_COUNT:-32}"
 SCENARIO_2BIN_COUNT="${SCENARIO_2BIN_COUNT:-3}"
 
-verify() { OUT_DIR="$APALACHE_OUT_DIR" quint verify "$@" --verbosity=0; }
+# quint's client and the Apalache server occasionally deadlock in their gRPC
+# handshake at spawn (observed repeatedly: both processes ~0% CPU forever, the
+# JVM's cumulative CPU stuck at startup-only seconds). Watchdog: if the check
+# is still running after HANG_CHECK_AFTER seconds while the apalache server
+# has accumulated under HANG_MIN_CPUTIME seconds of CPU, it never started
+# solving — kill both and retry once. A healthy run either finishes first or
+# shows minutes of JVM CPU by then.
+HANG_CHECK_AFTER="${HANG_CHECK_AFTER:-120}"
+HANG_MIN_CPUTIME="${HANG_MIN_CPUTIME:-15}"
+
+apalache_cputime() {
+  local jpid
+  jpid="$(pgrep -f 'apalache.jar server' | head -1 || true)"
+  if [[ -z "$jpid" ]]; then echo 0; return; fi
+  ps -p "$jpid" -o time= 2>/dev/null | awk -F'[:.]' '{ if (NF >= 3) print $1*60+$2; else print 0 }' || echo 0
+}
+
+verify() {
+  local attempt rc qpid waited jcpu
+  for attempt in 1 2; do
+    OUT_DIR="$APALACHE_OUT_DIR" quint verify "$@" --verbosity=0 &
+    qpid=$!
+    waited=0
+    rc=""
+    while true; do
+      if ! kill -0 "$qpid" 2>/dev/null; then
+        wait "$qpid" && rc=0 || rc=$?
+        break
+      fi
+      if [[ "$waited" -ge "$HANG_CHECK_AFTER" ]]; then
+        jcpu="$(apalache_cputime)"
+        if [[ "${jcpu:-0}" -lt "$HANG_MIN_CPUTIME" ]]; then
+          echo "  WARN: Apalache handshake hang (server cpu ${jcpu}s after ${waited}s) on: quint verify $*; killing and retrying" >&2
+          kill -9 "$qpid" 2>/dev/null || true
+          pkill -9 -f 'apalache.jar server' 2>/dev/null || true
+          sleep 2
+          rc=124
+          break
+        fi
+        wait "$qpid" && rc=0 || rc=$?   # healthy: server is grinding — wait it out
+        break
+      fi
+      sleep 5
+      waited=$((waited + 5))
+    done
+    if [[ "$rc" != "124" ]]; then return "$rc"; fi
+    if [[ "$attempt" -eq 2 ]]; then
+      echo "FATAL: Apalache handshake hang persisted after retry: quint verify $*" >&2
+      return 1
+    fi
+  done
+}
 
 echo "=== 1. Type checking ==="
 for m in types.qnt protocol.qnt invariants.qnt induction.qnt checked.qnt \
