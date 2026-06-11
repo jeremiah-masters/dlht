@@ -12,13 +12,14 @@ module protocol {
   pure val slotIdx: Set[SlotIdx] = 1.to(slotsPerBin)
   pure val slotIdxExt: Set[SlotIdx] = Set(0).union(slotIdx)
 
-  type SlotState = | Invalid | Trying | Valid
+  type SlotState = | Invalid | Trying | Valid | Shadow
   type PC =
     | PcIdle
     | PcG1 | PcG2
     | PcI1 | PcI2 | PcI3 | PcI4 | PcI5 | PcI6
     | PcP1 | PcP2 | PcP3 | PcP4 | PcP5 | PcP6 | PcP7
     | PcD1 | PcD2 | PcD3 | PcD4 | PcD5 | PcD6 | PcD7 | PcD8
+    | PcLC1 | PcLC2 | PcLC3 | PcLC4 | PcLC5 | PcLC6 | PcLC7 | PcLC8 | PcLC9
 
   type Header = {
     version: int,
@@ -45,6 +46,27 @@ module protocol {
 
   var local: PROC -> LocalState
 
+  // Snapshot of the full shared+control state. Pure invariant families take
+  // this instead of reading vars, so the induction anchor (induction.qnt) can
+  // evaluate them on *constructed* candidate states before assignment.
+  type SpecState = {
+    header: BinIdx -> Header,
+    slotKey: BinIdx -> (SlotIdx -> Option[KEY]),
+    slotVal: BinIdx -> (SlotIdx -> Option[VAL]),
+    slotTag: BinIdx -> (SlotIdx -> Option[int]),
+    nextTag: int,
+    pc: PROC -> PC,
+    op: PROC -> Op,
+    arg: PROC -> Option[Arg],
+    ret: PROC -> Option[Res],
+    local: PROC -> LocalState,
+  }
+
+  def currentSpecState: SpecState = {
+    header: header, slotKey: slotKey, slotVal: slotVal, slotTag: slotTag,
+    nextTag: nextTag, pc: pc, op: op, arg: arg, ret: ret, local: local,
+  }
+
   assume numBinsDef = numBins > 0
   assume slotsPerBinDef = slotsPerBin > 0
   assume hashDef = keyDomain.forall(k => binDomain.contains(hash.get(k)))
@@ -56,8 +78,8 @@ module protocol {
     keyDomain.size() > 0 and
     valDomain.size() > 0
 
-  pure val anyKey: KEY = keyDomain.chooseSome()
-  pure val anyVal: VAL = valDomain.chooseSome()
+  pure val anyKey: KEY = pickAny(keyDomain)
+  pure val anyVal: VAL = pickAny(valDomain)
 
   pure val emptyHeader: Header = {
     version: 0,
@@ -77,13 +99,22 @@ module protocol {
     match a {
       | KeyArg(k) => k
       | KeyValArg(kv) => kv._1
+      | LoadComputeArg(triple) => triple._1
     }
   }
 
   pure def valOfArg(a: Arg): VAL = {
     match a {
       | KeyValArg(kv) => kv._2
+      | LoadComputeArg(triple) => triple._2
       | _ => anyVal
+    }
+  }
+
+  pure def saveOfArg(a: Arg): bool = {
+    match a {
+      | LoadComputeArg(triple) => triple._3
+      | _ => false
     }
   }
 
@@ -101,6 +132,13 @@ module protocol {
     }
   }
 
+  def saveOfProc(p: PROC): bool = {
+    match arg.get(p) {
+      | Some(a) => saveOfArg(a)
+      | _ => false
+    }
+  }
+
   pure def visibleSlotsByHeaderFrom(h: Header, keyMap: BinIdx -> (SlotIdx -> Option[KEY]),
       valMap: BinIdx -> (SlotIdx -> Option[VAL]), tagMap: BinIdx -> (SlotIdx -> Option[int]),
       b: BinIdx, k: KEY): Set[SlotIdx] =
@@ -111,13 +149,25 @@ module protocol {
         tagMap.get(b).get(s) != None
     )
 
+  // Shadow slots only carry a key (value is a placeholder until LC7), so the
+  // filter is key-only.
+  pure def shadowSlotsByHeaderFrom(h: Header, keyMap: BinIdx -> (SlotIdx -> Option[KEY]),
+      b: BinIdx, k: KEY): Set[SlotIdx] =
+    slotIdx.filter(s =>
+      h.slotState.get(s) == Shadow and
+        keyMap.get(b).get(s) == Some(k)
+    )
+
+  def shadowSlotsByHeader(h: Header, b: BinIdx, k: KEY): Set[SlotIdx] =
+    shadowSlotsByHeaderFrom(h, slotKey, b, k)
+
   pure def readVisibleByHeaderFrom(h: Header, keyMap: BinIdx -> (SlotIdx -> Option[KEY]),
       valMap: BinIdx -> (SlotIdx -> Option[VAL]), tagMap: BinIdx -> (SlotIdx -> Option[int]),
       b: BinIdx, k: KEY): Option[VAL] = {
     val visible = visibleSlotsByHeaderFrom(h, keyMap, valMap, tagMap, b, k)
     if (visible.size() == 0) None
     else {
-      val s = visible.chooseSome()
+      val s = minOr0(visible)
       valMap.get(b).get(s)
     }
   }
@@ -129,12 +179,8 @@ module protocol {
     readVisibleByHeaderFrom(h, slotKey, slotVal, slotTag, b, k)
 
   def slotForKeyByHeader(h: Header, b: BinIdx, k: KEY): SlotIdx = {
-    val visible = visibleSlotsByHeader(h, b, k)
-    if (visible.size() == 0) 0 else visible.chooseSome()
+    minOr0(visibleSlotsByHeader(h, b, k))
   }
-
-  def concreteState: State =
-    keyDomain.mapBy(k => readVisibleByHeader(header.get(binOf(k)), binOf(k), k))
 
   pure def opFromPC(id: PC): Op = match id {
     | PcIdle => None
@@ -161,6 +207,15 @@ module protocol {
     | PcD6 => Some(Delete)
     | PcD7 => Some(Delete)
     | PcD8 => Some(Delete)
+    | PcLC1 => Some(LoadOrCompute)
+    | PcLC2 => Some(LoadOrCompute)
+    | PcLC3 => Some(LoadOrCompute)
+    | PcLC4 => Some(LoadOrCompute)
+    | PcLC5 => Some(LoadOrCompute)
+    | PcLC6 => Some(LoadOrCompute)
+    | PcLC7 => Some(LoadOrCompute)
+    | PcLC8 => Some(LoadOrCompute)
+    | PcLC9 => Some(LoadOrCompute)
   }
 
   pure def opStartLine(opname: OpName): PC = match opname {
@@ -168,6 +223,7 @@ module protocol {
     | Insert => PcI1
     | Put => PcP1
     | Delete => PcD1
+    | LoadOrCompute => PcLC1
   }
 
   pure def updateSlotState(h: Header, s: SlotIdx, newState: SlotState): Header = {
@@ -324,11 +380,20 @@ module protocol {
           pc' = pc.set(p, PcIdle),
           local' = local,
         }
+      } else if (shadowSlotsByHeader(h, b, k).size() != 0) {
+        // Shadow holder owns this key; back off until it resolves.
+        all {
+          pc' = pc.set(p, PcI1),
+          local' = local,
+          ret' = ret,
+          op' = op,
+          arg' = arg,
+        }
       } else {
         val free = slotIdx.filter(s => h.slotState.get(s) == Invalid)
         if (free.size() != 0) {
           all {
-            local' = local.set(p, withTargetSlot(local.get(p), free.chooseSome())),
+            local' = local.set(p, withTargetSlot(local.get(p), minOr0(free))),
             pc' = pc.set(p, PcI3),
             ret' = ret,
             op' = op,
@@ -768,6 +833,313 @@ module protocol {
     }
   }
 
+  // --------------------------- LoadOrCompute ------------------------------
+  // Mirrors Insert; publishes to Shadow at LC5, runs fn while in Shadow, then
+  // commits (Shadow -> Valid with fn's value) at LC7, or aborts via a
+  // TWO-PHASE path: LC7 posts the result and moves Shadow -> Trying (the
+  // abort's linearization point), LC9 clears the ghost val/tag and moves
+  // Trying -> Invalid. The two phases exist only because of the spec's
+  // anyVal ghost placeholder (there is ghost state to clear); the Go
+  // implementation keeps the entry nil through the window, has nothing to
+  // clear, and aborts with a SINGLE CAS Shadow -> Invalid (see LC4's
+  // implementation-contract comment).
+
+  action LC1(p) = {
+    val k = keyOfProc(p)
+    val b = binOf(k)
+    all {
+      pc.get(p) == PcLC1,
+      local' = local.set(p, withH0(local.get(p), header.get(b))),
+      pc' = pc.set(p, PcLC2),
+      unchanged_control,
+      unchanged_shared,
+    }
+  }
+
+  action LC2(p) = {
+    val k = keyOfProc(p)
+    val b = binOf(k)
+    val h = local.get(p).h0
+    all {
+      pc.get(p) == PcLC2,
+      if (header.get(b) != h) {
+        all {
+          pc' = pc.set(p, PcLC1),
+          local' = local,
+          ret' = ret,
+          op' = op,
+          arg' = arg,
+        }
+      } else if (lc2ReturnGuard(p)) {
+        all {
+          ret' = ret.set(p, mkResult(true, readVisibleByHeader(h, b, k))),
+          op' = op.set(p, None),
+          arg' = arg.set(p, None),
+          pc' = pc.set(p, PcIdle),
+          local' = local,
+        }
+      } else if (shadowSlotsByHeader(h, b, k).size() != 0) {
+        // Wait for the holder.
+        all {
+          pc' = pc.set(p, PcLC1),
+          local' = local,
+          ret' = ret,
+          op' = op,
+          arg' = arg,
+        }
+      } else {
+        val free = slotIdx.filter(s => h.slotState.get(s) == Invalid)
+        if (free.size() != 0) {
+          all {
+            local' = local.set(p, withTargetSlot(local.get(p), minOr0(free))),
+            pc' = pc.set(p, PcLC3),
+            ret' = ret,
+            op' = op,
+            arg' = arg,
+          }
+        } else {
+          all {
+            pc' = pc.set(p, PcLC1),
+            local' = local,
+            ret' = ret,
+            op' = op,
+            arg' = arg,
+          }
+        }
+      },
+      unchanged_shared,
+    }
+  }
+
+  action LC3(p) = {
+    val k = keyOfProc(p)
+    val b = binOf(k)
+    val s = local.get(p).targetSlot
+    all {
+      pc.get(p) == PcLC3,
+      if (s != 0 and header.get(b) == local.get(p).h0 and header.get(b).slotState.get(s) == Invalid) {
+        all {
+          header' = header.set(b, updateSlotState(header.get(b), s, Trying)),
+          pc' = pc.set(p, PcLC4),
+        }
+      } else {
+        all {
+          header' = header,
+          pc' = pc.set(p, PcLC1),
+        }
+      },
+      unchanged_control,
+      slotKey' = slotKey,
+      slotVal' = slotVal,
+      slotTag' = slotTag,
+      nextTag' = nextTag,
+      unchanged_local,
+    }
+  }
+
+  action LC4(p) = {
+    val k = keyOfProc(p)
+    val b = binOf(k)
+    val s = local.get(p).targetSlot
+    all {
+      pc.get(p) == PcLC4,
+      // anyVal is a placeholder; LC7 overwrites it with fn's value (or clears it).
+      // IMPLEMENTATION CONTRACT (Go) — the OWNERSHIP form, not an instant
+      // invariant: (1) at Shadow entry the pointer is nil BY CONSTRUCTION
+      // (reserve requires Invalid, and Invalid => nil per invalidSlotClean);
+      // (2) while Shadow, slot.Val is OWNER-EXCLUSIVE — the same rule that
+      // protects Trying; no other thread may read or act on a non-Valid
+      // slot's .Val; (3) the commit is release-store(entry) THEN CAS
+      // Shadow->Valid, so a transient Shadow-with-entry window physically
+      // exists — unobservable by the ownership rule and harmless by
+      // mechanism (the commit CAS bumps the version, so straddling seqlock
+      // readers retry; a racing DWCAS compares a pointer captured under a
+      // Valid window and fails); (4) in GO the abort needs no cleanup —
+      // nothing was stored — a single CAS Shadow->Invalid suffices (the
+      // SPEC's abort is two-phase, LC7 Shadow->Trying + LC9 cleanup, only
+      // because this ghost placeholder must be cleared). Some(anyVal) here is
+      // GHOST STATE: it exists so the slot carries a tag (= pointer identity)
+      // through the window, and liveKeyUniquePerBin's Shadow arm leans on
+      // val != None via ownerSlotFilled (F2). A Go implementation must
+      // derive Shadow-uniqueness from the KEY (slotKey, written before the
+      // Shadow release-CAS, hence acquire-coherent for waiters), never from
+      // the entry pointer.
+      slotKey' = slotKey.set(b, slotKey.get(b).set(s, Some(k))),
+      slotVal' = slotVal.set(b, slotVal.get(b).set(s, Some(anyVal))),
+      slotTag' = slotTag.set(b, slotTag.get(b).set(s, Some(nextTag))),
+      nextTag' = nextTag + 1,
+      pc' = pc.set(p, PcLC5),
+      unchanged_control,
+      header' = header,
+      local' = local,
+    }
+  }
+
+  action LC5(p) = {
+    val k = keyOfProc(p)
+    val b = binOf(k)
+    val s = local.get(p).targetSlot
+    all {
+      pc.get(p) == PcLC5,
+      if (lc5SuccessGuard(p)) {
+        all {
+          header' = header.set(b, updateSlotState(header.get(b), s, Shadow)),
+          pc' = pc.set(p, PcLC6),
+        }
+      } else {
+        // Header drifted; unreserve and retry. fn has not run yet.
+        all {
+          header' = header,
+          pc' = pc.set(p, PcLC8),
+        }
+      },
+      unchanged_control,
+      slotKey' = slotKey,
+      slotVal' = slotVal,
+      slotTag' = slotTag,
+      nextTag' = nextTag,
+      unchanged_local,
+    }
+  }
+
+  action LC6(p) = {
+    val k = keyOfProc(p)
+    val b = binOf(k)
+    all {
+      pc.get(p) == PcLC6,
+      // Post-fn: reload hLoop for the commit CAS.
+      local' = local.set(p, withHLoop(local.get(p), header.get(b))),
+      pc' = pc.set(p, PcLC7),
+      unchanged_control,
+      unchanged_shared,
+    }
+  }
+
+  action LC7(p) = {
+    val k = keyOfProc(p)
+    val v = valOfProc(p)
+    val save = saveOfProc(p)
+    val b = binOf(k)
+    val s = local.get(p).targetSlot
+    all {
+      pc.get(p) == PcLC7,
+      if (lc7SuccessGuard(p)) {
+        if (save) {
+          // Commit (linearization point for save=true).
+          all {
+            header' = header.set(b, updateSlotState(header.get(b), s, Valid)),
+            slotVal' = slotVal.set(b, slotVal.get(b).set(s, Some(v))),
+            slotTag' = slotTag.set(b, slotTag.get(b).set(s, Some(nextTag))),
+            nextTag' = nextTag + 1,
+            ret' = ret.set(p, mkResult(false, Some(v))),
+            op' = op.set(p, None),
+            arg' = arg.set(p, None),
+            pc' = pc.set(p, PcIdle),
+            local' = local,
+          }
+        } else {
+          // Abort phase 1: Shadow -> Trying, and LINEARIZATION POINT for
+          // save=false. The result (false, computed v) is fixed here, not at
+          // the LC9 return: at this step the slot is still Shadow with key k,
+          // so liveKeyUniquePerBin + shadowSlotKeyed guarantee k is absent from
+          // the visible set, which is exactly the abstract precondition for the
+          // "absent, fn ran, not saved" outcome. (Mirrors the save=true commit
+          // above, which also linearizes at LC7.) LC9 is then pure cleanup.
+          // The Shadow -> Trying flip keeps the slot invisible to L3/I2.5 scans,
+          // so LC9 can clear slot.Val without exposing a Shadow-with-nil-entry
+          // window to other LoadOrComputes.
+          all {
+            header' = header.set(b, updateSlotState(header.get(b), s, Trying)),
+            slotVal' = slotVal,
+            slotTag' = slotTag,
+            nextTag' = nextTag,
+            ret' = ret.set(p, mkResult(false, Some(v))),
+            op' = op,
+            arg' = arg,
+            pc' = pc.set(p, PcLC9),
+            local' = local,
+          }
+        }
+      } else {
+        // Header drifted; reload and retry.
+        all {
+          header' = header,
+          slotVal' = slotVal,
+          slotTag' = slotTag,
+          nextTag' = nextTag,
+          ret' = ret,
+          op' = op,
+          arg' = arg,
+          pc' = pc.set(p, PcLC6),
+          local' = local,
+        }
+      },
+      slotKey' = slotKey,
+    }
+  }
+
+  // LC8 mirrors I6: unreserve on LC5 failure, then retry from LC1.
+  action LC8(p) = {
+    val k = keyOfProc(p)
+    val b = binOf(k)
+    val s = local.get(p).targetSlot
+    all {
+      pc.get(p) == PcLC8,
+      if (s != 0 and header.get(b).slotState.get(s) == Trying and slotKey.get(b).get(s) == Some(k)) {
+        all {
+          header' = header.set(b, updateSlotState(header.get(b), s, Invalid)),
+          slotVal' = slotVal.set(b, slotVal.get(b).set(s, None)),
+          slotTag' = slotTag.set(b, slotTag.get(b).set(s, None)),
+        }
+      } else {
+        all {
+          header' = header,
+          slotVal' = slotVal,
+          slotTag' = slotTag,
+        }
+      },
+      pc' = pc.set(p, PcLC1),
+      unchanged_control,
+      slotKey' = slotKey,
+      nextTag' = nextTag,
+      unchanged_local,
+    }
+  }
+
+  // LC9 is abort phase 2: pure cleanup — clear slot.Val/Tag, CAS Trying ->
+  // Invalid, clear op (the return). The result was already posted to ret at
+  // LC7 (the linearization point), so LC9 does NOT touch ret. The slot
+  // transitioned Shadow -> Trying at LC7; while Trying it's invisible to
+  // L3/I2.5 scans, so clearing the entry pointer here cannot be observed.
+  action LC9(p) = {
+    val k = keyOfProc(p)
+    val b = binOf(k)
+    val s = local.get(p).targetSlot
+    all {
+      pc.get(p) == PcLC9,
+      if (s != 0 and header.get(b).slotState.get(s) == Trying and slotKey.get(b).get(s) == Some(k)) {
+        all {
+          header' = header.set(b, updateSlotState(header.get(b), s, Invalid)),
+          slotVal' = slotVal.set(b, slotVal.get(b).set(s, None)),
+          slotTag' = slotTag.set(b, slotTag.get(b).set(s, None)),
+        }
+      } else {
+        all {
+          header' = header,
+          slotVal' = slotVal,
+          slotTag' = slotTag,
+        }
+      },
+      pc' = pc.set(p, PcIdle),
+      op' = op.set(p, None),
+      arg' = arg.set(p, None),
+      ret' = ret,
+      slotKey' = slotKey,
+      nextTag' = nextTag,
+      local' = local,
+    }
+  }
+
   // ------------------------------------------------------------------------
   // Keep branch predicates centralized and reuse them in both:
   // 1) operation actions (G2/I2/I5/P3/P7/D3), and
@@ -815,6 +1187,41 @@ module protocol {
       slotTag.get(b).get(s) == local.get(p).expectedTag and
       slotTag.get(b).get(s) != None and
       slotVal.get(b).get(s) != None
+  }
+
+  def lc2ReturnGuard(p: PROC): bool = {
+    val k = keyOfProc(p)
+    val b = binOf(k)
+    val h = local.get(p).h0
+    header.get(b) == h and visibleSlotsByHeader(h, b, k).size() != 0
+  }
+
+  def lc5SuccessGuard(p: PROC): bool = {
+    val k = keyOfProc(p)
+    val b = binOf(k)
+    val s = local.get(p).targetSlot
+    val expectedH = {
+      version: local.get(p).h0.version + 1,
+      slotState: local.get(p).h0.slotState.set(s, Trying),
+    }
+    header.get(b) == expectedH and
+      slotKey.get(b).get(s) == Some(k) and
+      slotVal.get(b).get(s) == Some(anyVal) and
+      slotTag.get(b).get(s) != None
+  }
+
+  def lc7SuccessGuard(p: PROC): bool = {
+    val k = keyOfProc(p)
+    val b = binOf(k)
+    val s = local.get(p).targetSlot
+    header.get(b) == local.get(p).hLoop and
+      local.get(p).hLoop.slotState.get(s) == Shadow
+  }
+
+  // LC7 only returns on the save=true commit path; the save=false abort
+  // advances to PcLC9 (still intermediate).
+  def lc7CommitReturnGuard(p: PROC): bool = {
+    lc7SuccessGuard(p) and saveOfProc(p)
   }
 
   action invokeAction = {
@@ -933,11 +1340,47 @@ module protocol {
     }
   }
 
+  action loadComputeIntermAction = {
+    nondet p = procSet.oneOf()
+    any {
+      LC1(p),
+      all {
+        LC2(p),
+        not(lc2ReturnGuard(p)),
+      },
+      LC3(p),
+      LC4(p),
+      LC5(p),
+      LC6(p),
+      all {
+        LC7(p),
+        not(lc7CommitReturnGuard(p)),
+      },
+      LC8(p),
+    }
+  }
+
+  action loadComputeReturnAction = {
+    nondet p = procSet.oneOf()
+    any {
+      all {
+        LC2(p),
+        lc2ReturnGuard(p),
+      },
+      all {
+        LC7(p),
+        lc7CommitReturnGuard(p),
+      },
+      LC9(p),
+    }
+  }
+
   action intermAction = any {
     getIntermAction,
     insertIntermAction,
     putIntermAction,
     deleteIntermAction,
+    loadComputeIntermAction,
   }
 
   action returnAction = any {
@@ -945,6 +1388,7 @@ module protocol {
     insertReturnAction,
     putReturnAction,
     deleteReturnAction,
+    loadComputeReturnAction,
   }
 
   action step = any {
@@ -953,27 +1397,29 @@ module protocol {
     returnAction,
   }
 
-  def typeOK: bool = {
+  pure def typeOKPure(st: SpecState): bool = {
     binDomain.forall(b =>
       slotIdx.forall(s =>
-        (slotVal.get(b).get(s) == None) iff (slotTag.get(b).get(s) == None)
+        (st.slotVal.get(b).get(s) == None) iff (st.slotTag.get(b).get(s) == None)
       )
     ) and
 
-    binDomain.forall(b => header.get(b).version >= 0) and
-    nextTag >= 1 and
+    binDomain.forall(b => st.header.get(b).version >= 0) and
+    st.nextTag >= 1 and
 
-    procSet.forall(p => op.get(p) == opFromPC(pc.get(p))) and
-    procSet.forall(p => slotIdxExt.contains(local.get(p).targetSlot)) and
-    procSet.forall(p => local.get(p).h0.version >= 0 and local.get(p).hLoop.version >= 0) and
+    procSet.forall(p => st.op.get(p) == opFromPC(st.pc.get(p))) and
+    procSet.forall(p => slotIdxExt.contains(st.local.get(p).targetSlot)) and
+    procSet.forall(p => st.local.get(p).h0.version >= 0 and st.local.get(p).hLoop.version >= 0) and
 
     procSet.forall(p =>
-      if (op.get(p) == None)
-        arg.get(p) == None
-      else match arg.get(p) {
-        | Some(a) => argsOf(op.get(p)).contains(a)
+      if (st.op.get(p) == None)
+        st.arg.get(p) == None
+      else match st.arg.get(p) {
+        | Some(a) => argsOf(st.op.get(p)).contains(a)
         | _ => false
       }
     )
   }
+
+  def typeOK: bool = typeOKPure(currentSpecState)
 }
