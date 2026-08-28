@@ -3,9 +3,9 @@
 // DLHT is designed for high-concurrency scenarios and provides lock-free
 // operations for Get, Insert, Delete, and Put, plus LoadOrCompute, a
 // compute-if-absent that runs its value function at most once per key at a
-// time (same-key writers wait for it). It uses a sophisticated memory ordering
-// strategy and cooperative resizing to achieve excellent performance under
-// concurrent workloads.
+// time (same-key Insert and LoadOrCompute callers wait for it). It uses a
+// sophisticated memory ordering strategy and cooperative resizing to achieve
+// excellent performance under concurrent workloads.
 //
 // Example usage:
 //

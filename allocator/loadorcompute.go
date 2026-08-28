@@ -24,7 +24,9 @@ import (
 //   - a save=true value is always inserted: while fn runs nothing can make the
 //     key visible, so the computed value can never be discarded because a
 //     racing writer got there first. A concurrent Put or Delete of the key
-//     linearizes after the insertion.
+//     linearizes either before the insertion (it reports the key absent and
+//     leaves the claim alone) or after it (it replaces or removes the
+//     computed value).
 //
 // While fn runs, Get/Put/Delete/Range treat the key as absent, and Insert and
 // LoadOrCompute of the same key spin (cpu.Yield, then Gosched) until the
@@ -141,7 +143,8 @@ retry:
 	slot.Key = hash
 
 	// Step 5: Publish the claim (transition TryInsert to Shadow). From here the
-	// claim blocks same-key writers while staying invisible to readers.
+	// claim blocks same-key Insert and LoadOrCompute callers while staying
+	// invisible to readers, Put, and Delete.
 	if m.publishClaim(pb, h1, slotIndex) {
 		return m.computeAndResolve(idx, pb, slot, slotIndex, hash, key, fn)
 	}

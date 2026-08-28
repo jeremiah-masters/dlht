@@ -25,8 +25,8 @@ const (
 	SlotTrying  = 1 // 0b01: reserved by an inserter, invisible to everyone
 	// SlotShadow (0b10) is a LoadOrCompute claim: the slot's Key is written
 	// but the entry is nil until the holder commits (Shadow->Valid) or
-	// aborts (Shadow->Invalid). Invisible to readers, blocks same-key
-	// inserters.
+	// aborts (Shadow->Invalid). Invisible to readers, Put, and Delete;
+	// blocks same-key Insert and LoadOrCompute callers.
 	SlotShadow = 2
 	SlotValid  = 3 // 0b11: live entry, visible to readers
 )

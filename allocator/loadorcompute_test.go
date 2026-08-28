@@ -879,9 +879,9 @@ func TestLoadOrCompute_RecoverInsideFnPattern(t *testing.T) {
 }
 
 // An unrecovered panic propagates to the caller and orphans the claim.
-// Writers of the key would spin forever (not asserted: that is the
-// documented consequence, not a behavior to pin); readers never wait on a
-// claim, so they keep seeing the key as absent and the rest of the map
+// Insert or LoadOrCompute of the key would spin forever (not asserted: that
+// is the documented consequence, not a behavior to pin); readers never wait
+// on a claim, so they keep seeing the key as absent and the rest of the map
 // stays fully usable.
 func TestLoadOrCompute_UnrecoveredPanicPropagates(t *testing.T) {
 	m := New[uint64, uint64](Options{InitialSize: 16})

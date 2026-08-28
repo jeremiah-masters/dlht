@@ -1,10 +1,10 @@
 # DLHT
 
-DLHT is a high-performance, lock-free hash table for high-concurrency workloads based on DLHT: A Non-blocking Resizable Hashtable with Fast Deletes and Memory-awareness (<https://arxiv.org/abs/2406.09986>). It provides lock-free Get, Insert, Delete, and Put operations, plus LoadOrCompute (a compute-if-absent whose value function runs at most once per key at a time; same-key writers wait for it), with sophisticated memory ordering and cooperative resizing.
+DLHT is a high-performance, lock-free hash table for high-concurrency workloads based on DLHT: A Non-blocking Resizable Hashtable with Fast Deletes and Memory-awareness (<https://arxiv.org/abs/2406.09986>). It provides lock-free Get, Insert, Delete, and Put operations, plus LoadOrCompute (a compute-if-absent whose value function runs at most once per key at a time; same-key Insert and LoadOrCompute callers wait for it), with sophisticated memory ordering and cooperative resizing.
 
 ## Features
 
-- **Lock-free operations**: Get, Insert, Delete, and Put are lock-free and linearizable; LoadOrCompute is linearizable and blocks only same-key writers, only while its value function runs
+- **Lock-free operations**: Get, Insert, Delete, and Put are lock-free and linearizable; LoadOrCompute is linearizable and blocks only same-key Insert and LoadOrCompute callers, only while its value function runs (Get, Put, Delete, and Range never wait; they see the key as absent until it commits)
 - **High concurrency**: Scales well with multiple threads and cores
 - **Automatic resizing**: Cooperative resize algorithm that doesn't block operations
 - **Memory efficient**: Cache-line optimized data structures with bounded overflow
