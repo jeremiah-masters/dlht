@@ -13,10 +13,22 @@ const (
 	BinDoneTransfer = 2
 )
 
+// Slot states, 2 bits each. The encoding is chosen for the hot scan paths:
+// Valid = 0b11 makes the exact valid mask `s & (s >> 1)`, whose shift and
+// bitmap AND run in parallel, keeping the original two-deep dependency
+// chain, while Shadow = 0b10 pushes the three-deep exact match
+// `(s >> 1) &^ s` onto the cold claim scans. Invalid = 0b00 keeps the
+// free-slot mask a pure NOR. Every mask matches its state exactly; no state
+// is identified by a single bit.
 const (
-	SlotInvalid = 0
-	SlotTrying  = 1
-	SlotValid   = 2
+	SlotInvalid = 0 // 0b00: empty, available for reserve
+	SlotTrying  = 1 // 0b01: reserved by an inserter, invisible to everyone
+	// SlotShadow (0b10) is a LoadOrCompute claim: the slot's Key is written
+	// but the entry is nil until the holder commits (Shadow->Valid) or
+	// aborts (Shadow->Invalid). Invisible to readers, blocks same-key
+	// inserters.
+	SlotShadow = 2
+	SlotValid  = 3 // 0b11: live entry, visible to readers
 )
 
 const (

@@ -57,23 +57,51 @@ func atomicStoreSlotVal[K Key, V any](slot *Slot[K, V], entry *Entry[K, V]) {
 	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&slot.Val)), unsafe.Pointer(entry))
 }
 
-// validMask3 returns a spread bitmask indicating which of the first 3 slots are valid (state == 2).
+// validMask3 returns a spread bitmask indicating which of the first 3 slots are valid (state == 0b11).
 // Bits are at positions 0, 2, 4 (not compacted to 0, 1, 2). Use bits.TrailingZeros32(mask) >> 1
 // to convert to a slot index.
 //
-// Invariant: slot state 3 (0b11) never occurs in the protocol, so the high bit
-// of each 2-bit state field alone identifies Valid (state 2 = 0b10).
+// Valid (0b11) is matched exactly: both bits of the pair set. Shadow (0b10)
+// must never appear valid: its entry is nil (or, transiently during commit,
+// not yet published), and treating it as a candidate would let readers
+// return a value before the commit CAS linearizes it.
 func (h Header) validMask3() uint32 {
-	return (uint32(h) >> 1) & 0x15
+	s := uint32(h)
+	return (s & (s >> 1)) & 0x15
 }
 
 // validMask4 returns a spread bitmask indicating which of 4 slots starting at base are valid.
 // Bits are at positions 0, 2, 4, 6 (not compacted to 0, 1, 2, 3). Use bits.TrailingZeros32(mask) >> 1
 // to convert to a slot index relative to base.
 //
-// Invariant: slot state 3 (0b11) never occurs in the protocol.
+// Valid (0b11) is matched exactly; see validMask3.
 func (h Header) validMask4(base uint) uint32 {
-	return (uint32(h) >> ((base << 1) + 1)) & 0x55
+	s := uint32(h) >> (base << 1)
+	return (s & (s >> 1)) & 0x55
+}
+
+// shadowMask3 returns a spread bitmask (bits 0, 2, 4) of the first 3 slots in
+// Shadow state (0b10): high bit set, low bit clear.
+func (h Header) shadowMask3() uint32 {
+	s := uint32(h)
+	return ((s >> 1) &^ s) & 0x15
+}
+
+// shadowMask4 returns a spread bitmask (bits 0, 2, 4, 6) of the 4 slots
+// starting at base that are in Shadow state (0b10).
+func (h Header) shadowMask4(base uint) uint32 {
+	s := uint32(h) >> (base << 1)
+	return ((s >> 1) &^ s) & 0x55
+}
+
+// shadowMaskAll reports the Shadow slots across all 15 slot-state pairs as a
+// spread bitmask (low bit of each pair: positions 0, 2, ..., 28). Zero means
+// no LoadOrCompute claim anywhere in the bin: the common case, so callers
+// can early-out before resolving any slot. The bin-state bits [31:30] cannot
+// leak in: position 29 (bit 30 shifted right) is not in the mask.
+func (h Header) shadowMaskAll() uint32 {
+	s := uint32(h)
+	return ((s >> 1) &^ s) & 0x15555555
 }
 
 // invalidMask3 returns a spread bitmask indicating which of the first 3 slots are invalid (state == 0).

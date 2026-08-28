@@ -16,9 +16,10 @@ type perKeyInput[V comparable] struct {
 
 // perKeyOutput represents the output of a per-key operation for Porcupine.
 type perKeyOutput[V comparable] struct {
-	Found   bool
-	Updated bool
-	Value   V
+	Found    bool
+	Updated  bool
+	Computed bool
+	Value    V
 }
 
 // perKeyState represents the state of a single key for Porcupine.
@@ -111,6 +112,20 @@ func perKeyModel[V comparable](initial perKeyState[V]) porcupine.Model {
 				expected := perKeyOutput[V]{Found: false, Value: zero}
 				return out == expected, s
 
+			case OpLoadOrCompute, OpLoadOrComputeNoSave:
+				if s.exists {
+					// Key exists: loaded, fn did not run.
+					expected := perKeyOutput[V]{Found: true, Value: s.value}
+					return out == expected, s
+				}
+				// Key absent: fn ran exactly once and its value is returned;
+				// save=true inserts it, save=false leaves the key absent.
+				expected := perKeyOutput[V]{Found: false, Computed: true, Value: in.Value}
+				if in.Kind == OpLoadOrCompute {
+					return out == expected, perKeyState[V]{exists: true, value: in.Value}
+				}
+				return out == expected, s
+
 			default:
 				return false, s
 			}
@@ -146,6 +161,14 @@ func perKeyModel[V comparable](initial perKeyState[V]) porcupine.Model {
 					return fmt.Sprintf("Delete -> deleted (was %v)", out.Value)
 				}
 				return "Delete -> not found"
+			case OpLoadOrCompute, OpLoadOrComputeNoSave:
+				if out.Found {
+					return fmt.Sprintf("%v(%v) -> loaded %v", in.Kind, in.Value, out.Value)
+				}
+				if out.Computed {
+					return fmt.Sprintf("%v(%v) -> computed %v", in.Kind, in.Value, out.Value)
+				}
+				return fmt.Sprintf("%v(%v) -> %v (fn did not run?)", in.Kind, in.Value, out.Value)
 			default:
 				return fmt.Sprintf("Unknown(%d)", in.Kind)
 			}
@@ -167,9 +190,10 @@ func toPorcupineEvents[K comparable, V comparable](ops []TimedOp[K, V]) []porcup
 			ClientId: ops[i].ThreadId,
 			Input:    perKeyInput[V]{Kind: ops[i].Op.Kind, Value: ops[i].Op.Value},
 			Output: perKeyOutput[V]{
-				Found:   ops[i].Result.Found,
-				Updated: ops[i].Result.Updated,
-				Value:   ops[i].Result.Value,
+				Found:    ops[i].Result.Found,
+				Updated:  ops[i].Result.Updated,
+				Computed: ops[i].Result.Computed,
+				Value:    ops[i].Result.Value,
 			},
 			Call:   int64(ops[i].StartSeq),
 			Return: int64(ops[i].EndSeq),

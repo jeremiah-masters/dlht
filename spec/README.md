@@ -22,7 +22,7 @@ work-stealing machinery): `rsTrigger` (allocate + indexNext publish),
 `rsSentinel` (its own atomic step — the per-slot StoreLoad cut against
 Put/Delete DWCAS), `rsMove` (fused read+place into the child; skips
 concurrently-deleted entries), `rsShadowCarry` (the LoadOrCompute claim
-carry — a spec-prescribed contract; today's Go resize has no Shadow),
+carry — implemented in Go by `allocator/resize.go`'s `carryShadowSlots`),
 `rsDone` (a snapshot **overwrite**, discarding transfer-window D8 ANDs;
 sentinels persist in dead-bin slot keys forever), and `rsFinalize`
 (`m.active` advances). `system.qnt` composes `systemStep = protocol step ∨
@@ -175,18 +175,25 @@ stage-1a evidence tier is described below.
   theorem (`rsDone` is an abstract no-op). The Phase 0 inductive +
   anchored-refinement results continue to hold on the maxGen=0 configs
   (re-verified; `rsInvPure` additions are inert there by `genTopology`).
-- **Insert's keep-slot retry path**: on finalize failure, the Go implementation
-  (`allocator/insert.go:102–153`, `retryWithSlot`) KEEPS its `Trying`
-  reservation, re-scans under a fresh header `h2`, and re-finalizes with `h2`
-  as the CAS expectation; the spec models unreserve-and-restart (I6 → I1)
-  instead. This is a sound coarsening for linearizability — every keep-slot
-  outcome maps to an unreserve+retry execution with identical abstract
-  behavior — but the re-finalize-under-fresh-header edge itself is NOT
-  machine-verified. Its correctness rests on the header's ABA-freedom:
-  versions only grow, and the only version-silent header write (D8's AND)
-  cannot recreate a prior bit pattern without intervening bumps. Modeling it
-  (new PCs I7/I8 + anchor/`allPCs`/space-table growth + full re-verification)
-  is a candidate next work item.
+- **The keep-slot retry paths (Insert finalize, LoadOrCompute publish)**: on
+  finalize failure, the Go implementation (`allocator/insert.go`,
+  `retryWithSlot`) KEEPS its `Trying` reservation, re-scans under a fresh
+  header `h2`, and re-finalizes with `h2` as the CAS expectation; the spec
+  models unreserve-and-restart (I6 → I1) instead. `LoadOrCompute` does the
+  same on publish failure (`allocator/loadorcompute.go`, `retryWithSlot`):
+  re-scan under `h2` (key present → unreserve, return it; another Shadow claim
+  on the hash → unreserve, back off), then re-publish Trying → Shadow with
+  `h2` as the expectation, where the spec models LC8 (unreserve) → LC1. Both
+  are sound coarsenings for linearizability — every keep-slot outcome maps to
+  an unreserve+retry execution with identical abstract behavior (a Trying slot
+  is inert to every other proc, and the CAS-against-`h2` re-establishes the
+  I2/LC2 preconditions atomically) — but the re-finalize/re-publish-under-
+  fresh-header edges themselves are NOT machine-verified. Their correctness
+  rests on the header's ABA-freedom: versions only grow, and the only
+  version-silent header writes (D8's AND, the InTransfer OR, the Done store)
+  cannot recreate a prior bit pattern without intervening bumps. Modeling them
+  (new PCs I7/I8, LC11/LC12 + anchor/`allPCs`/space-table growth + full
+  re-verification) is a candidate next work item.
 - **Entry pointer identity assumes GC no-reuse**: `slotTag`/`nextTag` model each
   entry pointer as never reused — sound for Go (a parked op's captured `*Entry`
   keeps the object reachable, so the allocator can't recycle it while a DWCAS

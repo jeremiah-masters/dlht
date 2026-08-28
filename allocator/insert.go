@@ -10,6 +10,11 @@ import (
 
 // Insert inserts (key, value) into the map. If the key already exists, it returns the existing value and false.
 // Returns (previousValue, success) where success indicates if the insertion succeeded.
+//
+// If a LoadOrCompute of the same key (or of a key with the same 64-bit hash)
+// is running its value function, Insert waits for it to finish, then either
+// returns the computed value or inserts. Calling Insert for the key from
+// inside that value function therefore never returns.
 func (m *Map[K, V]) Insert(key K, value V) (V, bool) {
 	hash := maphash.Comparable(m.hashConfig.Seed, key)
 	idx := m.getActiveIndex()
@@ -34,7 +39,7 @@ retry:
 	}
 
 	// Step 2: Run the Get algorithm - check if key already exists
-	bitmap := m.matchPrimaryBucketKeys(pb, h0, hash)
+	bitmap := m.matchPrimaryBucketKeys(pb, h0.validMask3(), hash)
 
 	// Check all hash matches in the primary bucket
 	for bitmap != 0 {
@@ -55,6 +60,19 @@ retry:
 			return entry.Value, false
 		}
 		goto retry
+	}
+
+	// Step 2.1: A Shadow slot holding this hash is a pending LoadOrCompute
+	// claim on this key; back off until the holder resolves it. Reserving a
+	// slot anyway would collide with the holder's commit (duplicate key). A
+	// claim is never abandoned in a live bin (its holder always commits,
+	// aborts, or relocates), so the wait terminates. When no claim exists
+	// anywhere in the bin (the common case) this is a three-instruction test.
+	if h0.shadowMaskAll() != 0 {
+		if si, _ := m.findShadowSlot(idx, pb, h0, hash); si >= 0 {
+			m.waitForClaim(idx, pb, hash)
+			goto retry
+		}
 	}
 
 	// Step 3: Find the first slot that is in Invalid state.
@@ -118,7 +136,7 @@ retryWithSlot:
 	}
 
 	// Check if key now exists in primary bucket
-	bitmap2 := m.matchPrimaryBucketKeys(pb, h2, hash)
+	bitmap2 := m.matchPrimaryBucketKeys(pb, h2.validMask3(), hash)
 
 	for bitmap2 != 0 {
 		slotIdx := bits.TrailingZeros32(bitmap2) >> 1
@@ -141,6 +159,19 @@ retryWithSlot:
 			return entry.Value, false
 		}
 		goto retryWithSlot
+	}
+
+	// Same Shadow back-off as Step 2.1. This site is essential: h2 is a
+	// FRESH header, so re-finalizing against it would succeed right past a
+	// LoadOrCompute claim published after our reservation, and the holder's
+	// later commit would duplicate the key. (The spec models this path as
+	// unreserve-and-restart, where the Step 2.1 arm catches it; the keep-slot
+	// retry must re-check on its own.) Give up the slot and wait from the top.
+	if h2.shadowMaskAll() != 0 {
+		if si, _ := m.findShadowSlot(idx, pb, h2, hash); si >= 0 {
+			m.unreserveSlot(idx, pb, slotIndex)
+			goto retry
+		}
 	}
 
 	// Key doesn't exist yet, try to finalize our reserved slot again

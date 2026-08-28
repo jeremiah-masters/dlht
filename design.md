@@ -126,7 +126,7 @@ This allows readers to proceed without taking locks while guaranteeing they neve
 
 The 2-bit bin state tracks resize progress. A bin starts in NoTransfer (00), transitions to InTransfer (01) when being moved, and ends at DoneTransfer (10) when migration completes. Operations check this state and redirect to the new index when necessary.
 
-The remaining 30 bits encode states for up to 15 slots (2 bits each). Each slot can be Invalid (00), Trying (01), or Valid (10). Only Valid slots are visible to readers. The Trying state is crucial for insert atomicity—it marks a slot as "claimed but not yet published."
+The remaining 30 bits encode states for up to 15 slots (2 bits each). Each slot can be Invalid (00), Trying (01), Shadow (10), or Valid (11). Only Valid slots are visible to readers. The Trying state is crucial for insert atomicity—it marks a slot as "claimed but not yet published." The Shadow state is LoadOrCompute's claim: like Trying it is invisible to readers, but unlike Trying it *blocks* other same-key inserters while the value function runs (see "Computing: LoadOrCompute and the Shadow Claim").
 
 ### Slots and Entries: The Two-Level Structure
 
@@ -243,14 +243,21 @@ stateDiagram-v2
     Trying: Reserved by inserter
     Trying: Invisible to readers
 
-    Valid: Valid (10)
+    Valid: Valid (11)
     Valid: Contains live entry
     Valid: Visible to readers
 
+    Shadow: Shadow (10)
+    Shadow: LoadOrCompute claim, fn running
+    Shadow: Invisible to readers, blocks same-key inserters
+
     Invalid --> Trying: reserveSlot CAS\n(slot 00→01, ver++)
-    Trying --> Valid: finalizeSlot CAS\n(slot 01→10, ver++)
+    Trying --> Valid: finalizeSlot CAS\n(slot 01→11, ver++)
     Trying --> Invalid: unreserveSlot CAS\n(only if BinNoTransfer)
-    Valid --> Invalid: markSlotInvalid AND\n(slot 10→00, no ver bump)
+    Trying --> Shadow: publish CAS\n(slot 01→10, ver++)
+    Shadow --> Valid: commit CAS\n(slot 10→11, ver++, save=true)
+    Shadow --> Invalid: abort CAS\n(slot 10→00, ver++, save=false)
+    Valid --> Invalid: markSlotInvalid AND\n(slot 11→00, no ver bump)
 ```
 
 **Invalid → Trying**: An inserting thread claims a slot by atomically transitioning it from Invalid to Trying. This CAS compares the entire 64-bit header, so it fails if any other thread modified anything in the bucket. The Trying state is invisible to readers (not included in validity masks) but blocks other inserters from claiming the same slot.
@@ -259,11 +266,17 @@ stateDiagram-v2
 
 **Trying → Invalid**: If an insert needs to abort (found a duplicate key, resize started), it can unreserve the slot. This only succeeds if the bin is still in normal operation—once transfer starts, the slot belongs to the transfer process.
 
+**Trying → Shadow**: LoadOrCompute publishes its claim. The slot's hash is already written (while Trying, exactly like Insert's fill), the entry pointer is deliberately still nil, and the CAS expects the exact post-reserve header (or, on a retry, the freshly reloaded header the rescan ran under). From this point the claim is visible to would-be same-key inserters — Insert and LoadOrCompute back off on it — while remaining invisible to readers. The user's value function runs while the slot is Shadow.
+
+**Shadow → Valid**: The commit. The holder release-stores the computed entry into the slot, then CASes Shadow to Valid — the linearization point of a successful compute. The transient "Shadow with entry" window between the store and the CAS is unobservable: no reader's validity mask includes a Shadow slot, and no DWCAS can match a freshly allocated entry pointer.
+
+**Shadow → Invalid**: The abort (the value function returned save=false). Nothing was ever stored in the slot, so a single CAS releases it; the version bump keeps header history ABA-free.
+
 **Valid → Invalid**: After Delete's DWCAS clears the entry pointer, a best-effort `markSlotInvalid` transitions the slot from Valid to Invalid. Between the DWCAS and this cleanup, the slot is in a transient state (Valid in header, nil entry pointer). Readers skip it because they check `entry != nil`. The cleanup makes the slot available for reuse by Insert.
 
 Unlike the other transitions, `markSlotInvalid` uses `atomic.AndUint64` to clear the slot's two state bits unconditionally, with no CAS loop and no version bump. This is safe because:
 
-- Readers still detect the change: the bit transition `10 → 00` makes the post-read header differ from the pre-read header, so the seqlock check retries.
+- Readers still detect the change: the bit transition `11 → 00` makes the post-read header differ from the pre-read header, so the seqlock check retries.
 - ABA is impossible: any subsequent Insert re-using this slot performs a reserve CAS that *does* bump the version, so a reader cannot be fooled into accepting a stale snapshot by a coincidence of bit patterns.
 - No precondition check is needed: the slot must be Valid (the DWCAS just succeeded), the entry pointer must be nil (the DWCAS set it), and resize only cares about entry pointers, not slot states.
 
@@ -305,17 +318,18 @@ If bin state is DoneTransfer, we follow `idx.indexNext` to the successor index a
 
 **Step 2: Extract the validity mask and scan slots.**
 
-The `validMask3()` function extracts which of the 3 primary slots are Valid using bit manipulation. It exploits a protocol invariant: slot state `0b11` never occurs—slots only transition through `00` (Invalid), `01` (Trying), and `10` (Valid). With `0b11` ruled out, the high bit of each 2-bit state field *alone* identifies Valid (state `10`):
+The `validMask3()` function extracts which of the 3 primary slots are Valid using bit manipulation. Every state is matched *exactly* — no state is identified by a single bit — and the encoding is chosen so the hottest mask is also the cheapest: Valid is `11`, so "both bits set" identifies it, and the shift runs in parallel with the caller's bitmap AND (the same two-deep dependency chain as a single-bit test):
 
 ```go
 func (h Header) validMask3() uint32 {
-    return (uint32(h) >> 1) & 0x15
+    s := uint32(h)
+    return (s & (s >> 1)) & 0x15
 }
 ```
 
 `0x15` is `0b010101`—bits at positions 0, 2, and 4. The result is a *spread bitmap*: bit `i*2` is set iff slot `i` is Valid. Callers recover the slot index with `bits.TrailingZeros32(mask) >> 1`, and clear the lowest-set bit via `mask &= mask - 1` to advance to the next match. Keeping the spread form lets us `AND` it directly with a parallel "hash matches" spread bitmap during key lookup without any shuffling.
 
-A companion `validMask4(base)` does the same for a 4-slot link bucket starting at the given bit offset (6, 14, or 22 in the header), and `invalidMask3`/`invalidMask4` produce the complementary "which slots are Invalid" bitmaps used by the insert path to pick a free slot.
+A companion `validMask4(base)` does the same for a 4-slot link bucket starting at the given bit offset (6, 14, or 22 in the header); `invalidMask3`/`invalidMask4` produce the complementary "which slots are Invalid" (`00`, also an exact match) bitmaps used by the insert path to pick a free slot; and `shadowMask3`/`shadowMask4`/`shadowMaskAll` extract the Shadow (`10`, high bit AND-NOT low bit — one `ANDN`/`BIC`, paid only on the cold claim scans) slots for LoadOrCompute's claim scans and the resize carry.
 
 This branchless bit manipulation is faster than separate comparisons. The fast path checks primary slots first; only if the key isn't found do we check link buckets.
 
@@ -660,10 +674,10 @@ func (m *Map[K, V]) markSlotInvalid(pb *PrimaryBucket[K, V], slotIdx int) {
 │(32b)|   (2b)   |   (30b)    │    (32b)    │  (32b)    │(64b)| (64b) │(64b)| (64b) │(64b)| (64b) │
 ├─────┼──────────┼────────────┼─────────────┼───────────┼─────┼───────┼─────┼───────┼─────┼───────┤
 │ 44  │    00    │  S2 S1 S0  │      00     │     00    │ K3  │  V3   │ K1  │ nil   │ K2  │  V2   │
-│     │NoTransfer│  10 00 10  │   NO_LINK   │  NO_LINK  │     │       │     │       │     │       │
+│     │NoTransfer│  11 00 11  │   NO_LINK   │  NO_LINK  │     │       │     │       │     │       │
 └─────┴──────────┴────────────┴─────────────┴───────────┴─────┴───────┴─────┴───────┴─────┴───────┘
                      ▲
-           Changed: 10 → 00 (Valid → Invalid)
+           Changed: 11 → 00 (Valid → Invalid)
            Version: 44 → 44 (unchanged — AND does not bump version)
 ```
 
@@ -671,10 +685,35 @@ This cleanup transitions the slot from Valid to Invalid in the header, making it
 
 - The slot's state bits are Valid (our DWCAS just succeeded against them).
 - The entry pointer is nil (our DWCAS set it).
-- No concurrent Insert can have recycled the slot: reserve CAS only fires against Invalid slots, and the state bits are still Valid until this AND runs. So the state bits we're about to clear are exactly `10`, as expected.
+- No concurrent Insert can have recycled the slot: reserve CAS only fires against Invalid slots, and the state bits are still Valid until this AND runs. So the state bits we're about to clear are exactly `11`, as expected.
 - Resize reads entry *pointers* to decide what to transfer, not slot states, so if a concurrent resize set `BinInTransfer` between our DWCAS and this AND it's harmless: the transfer will see a nil pointer and skip the slot regardless of what the state bits say.
 
-The AND doesn't bump the version, but correctness doesn't require it to: the *bit pattern* of the header changes (state `10 → 00`), so any seqlock reader that loaded the header before the AND and re-loads after will observe a different 64-bit value and retry. ABA is impossible because the next operation to modify this slot—an Insert's reserve CAS—does bump the version, so a reader cannot be fooled by a coincidence of bit patterns.
+The AND doesn't bump the version, but correctness doesn't require it to: the *bit pattern* of the header changes (state `11 → 00`), so any seqlock reader that loaded the header before the AND and re-loads after will observe a different 64-bit value and retry. ABA is impossible because the next operation to modify this slot—an Insert's reserve CAS—does bump the version, so a reader cannot be fooled by a coincidence of bit patterns.
+
+---
+
+## Computing: LoadOrCompute and the Shadow Claim
+
+`LoadOrCompute(key, fn)` returns the existing value if the key is present; otherwise it calls `fn` exactly once and, if `fn` returns `save=true`, inserts the computed value. Two guarantees distinguish it from a Get-then-Insert composition, and neither is achievable with the three-state protocol alone:
+
+- **fn runs at most once per key at a time** — and, in the common pattern (always save, no deletes), exactly once map-wide no matter how many callers race.
+- **a computed (save=true) value is always inserted** — the operation can never be forced to throw the value away because a racer inserted first.
+
+The mechanism is a fourth slot state, **Shadow (0b10)**, realizing the transactional mode sketched in the DLHT paper. The protocol is machine-checked in `spec/protocol.qnt` (steps LC1–LC10; the two guarantees are the `contractAtMostOneComputePerKey` and `contractHolderExclusive` corollaries of the inductive invariant).
+
+The compute path mirrors Insert's three-phase structure with one extra hop:
+
+1. **Scan** under the seqlock header. Key present → return it (this is the entire fast path; `fn` never runs). A *Shadow slot whose key matches* → another caller's `fn` is in flight; spin (`cpu.Yield`/`Gosched`) and rescan. Otherwise pick a free slot.
+2. **Reserve** the slot Invalid→Trying and write the hash — exactly Insert's claim, invisible to everyone.
+3. **Publish** the claim Trying→Shadow with a CAS against the exact post-reserve header. From here the claim blocks same-key writers but stays invisible to readers; the slot's entry pointer is deliberately **nil** — the not-yet-computed value cannot be represented, and a nil entry means no DWCAS can ever bite the slot. If the CAS fails (some other operation touched the bin in between), `fn` has not run yet, and the claim goes through the same **retry-with-slot** loop as Insert's finalize: keep the Trying reservation, reload the header, rescan — the key may have been inserted meanwhile (unreserve, return it) or another caller may have published a claim on it (unreserve, wait from the top) — and otherwise re-publish against the fresh header. Every failed publish is caused by some other operation's successful header write (a CAS, or a delete's cleanup AND / a resize's bin-state change), so the loop makes progress without the release-and-restart churn a full retry would cost.
+4. **Run `fn`** — once, with no header CAS in flight. `fn` must return normally: there is no built-in panic containment (a deferred abort would tax every compute), so an `fn` that panics or calls `runtime.Goexit` orphans its claim — the key reads as absent forever, and later writers of that key (or of a key sharing its 64-bit hash) spin on it. Fallible `fn`s recover *inside* `fn` and return `save=false`.
+5. **Resolve**: release-store the computed entry and CAS Shadow→Valid (`save=true` — the linearization point), or CAS Shadow→Invalid (`save=false`; nothing was stored, nothing to clear).
+
+Why can't Trying serve as the claim? Two reasons, both structural. Trying is deliberately *invisible* to concurrent inserters — Insert resolves same-key races at finalize time, so a racing Insert would publish the key mid-`fn` and force the computer to discard its value. And Trying slots can be legitimately *abandoned* (the unreserve-refusal path when a bin starts transferring), so waiting on one could wait on a claim nobody holds. Shadow claims carry the opposite contracts: same-key inserters must wait on them, and they are never abandoned — the holder always commits, aborts, or relocates.
+
+Insert gains the matching back-off arm in both of its paths (the initial scan and the keep-slot retry rescans): if a Shadow slot holds the key's hash, back off until the holder resolves. When no claim exists anywhere in the bin — the overwhelmingly common case — this costs a three-instruction mask test (`shadowMaskAll`). Get, Put, Delete, and Range need no new logic at all: their exact-Valid masks already exclude Shadow slots, which is precisely the semantics — the key is absent until the commit.
+
+During a resize, a claim is **carried, not moved**: the transfer copies the claim's hash into a Shadow slot of the new index's bin (no sentinel — nothing can DWCAS a Shadow slot; no entry — there is nothing to copy). The holder, on finding its bin `InTransfer`, spins — never restarts (that would orphan the claim being carried) and physically cannot commit (its CAS expectation has NoTransfer bin-state bits). On `DoneTransfer` it relocates: the carried claim is the unique Shadow slot holding its hash in the successor bin, guaranteed to exist by the spec's `carriedClaimExists`/`rsCompleteness` invariants. The computed value travels in the holder's locals and is re-stored against the carried slot, so a resize completing mid-`fn` — even one triggered from inside `fn` — costs the holder one relocation hop and nothing else.
 
 ---
 
@@ -793,6 +832,13 @@ func (m *Map[K, V]) transferBin(ctx *resizeContext[K, V], binIndex uint64) {
             ctx.oldIndex.getLinkBucket(p+1).slotAt(0), sentinel)
     }
 
+    // Carry LoadOrCompute claims (key only, no sentinel, nil entry;
+    // driven by the snapshot's shadowMask3/shadowMask4 — see below)
+    if h.shadowMaskAll() != 0 {
+        m.carryShadowSlots(ctx, h.shadowMask3(), oldBin.slotAt(0))
+        // ... and the same walk over the attached link buckets
+    }
+
     // Mark transfer complete; this store releases all writes into the new index
     finalHeader := h.setBinState(BinDoneTransfer)
     atomic.StoreUint64((*uint64)(&oldBin.Header), uint64(finalHeader))
@@ -802,6 +848,8 @@ func (m *Map[K, V]) transferBin(ctx *resizeContext[K, V], binIndex uint64) {
 The key insight is that `atomic.OrUint64` (added in Go 1.23) returns the value *before* the OR operation. This gives us a consistent snapshot of which slots were Valid at the moment we claimed the bin, and simultaneously acts as an acquire-release fence: no further Insert can finalize a slot in this bin (its finalize CAS will fail, because the bin-state bits have changed), and no Delete can invalidate a slot after this point (its inner seqlock check detects the header change).
 
 We iterate using *the snapshot's* `validMask3` / `validMask4`, not the live header. Slots that were Trying when we took the snapshot are skipped—those inserts will fail their finalize and retry on the new index. Slots that were Valid are transferred. A slot that was Valid in the snapshot may have been concurrently cleared by a Delete's DWCAS (entry pointer set to nil); `transferValidSlots` detects this nil and skips the slot—the key has already been logically removed.
+
+Shadow slots — pending LoadOrCompute claims — get a third treatment: `carryShadowSlots` walks the snapshot's `shadowMask3` / `shadowMask4` and *carries* each claim into the new index (`claimIntoNewIndex`: the hash into a fresh Shadow slot, entry nil). No sentinel is written — sentinels exist to cut Put/Delete DWCAS races, which cannot target a Shadow slot — and the snapshot's Shadow set cannot change mid-transfer, because a claim resolves only via a CAS whose expected header has NoTransfer bin-state bits. The claim's holder relocates to the carried slot after observing `BinDoneTransfer` (see "Computing: LoadOrCompute and the Shadow Claim").
 
 ### Writing Into the New Index
 
@@ -957,6 +1005,8 @@ A concurrent data structure is linearizable if every operation appears to take e
 **Delete** linearizes at the DWCAS that atomically clears the entry pointer: `(hash, entry) → (hash, nil)`. Before this point, the entry was readable. After, any reader loading the slot sees a nil pointer and skips it. A subsequent best-effort header AND (`markSlotInvalid`) transitions the slot from Valid to Invalid so the slot can be reused, but correctness does not depend on it completing. The old Entry pointer captured by the DWCAS provides the return value.
 
 **Put** linearizes at the successful DWCAS. The old value existed until this instant; the new value exists after. The DWCAS atomically verifies the entry is still present (key matches) and updates the value.
+
+**LoadOrCompute** linearizes like Get when it loads an existing value (the seqlock-validated header load). When `fn` runs, it linearizes at the resolve CAS: the commit CAS (Shadow → Valid) for `save=true`, which is the instant the computed value becomes visible, and the abort CAS (Shadow → Invalid) for `save=false`, at which instant the key is provably absent — while the claim was held nothing could make the key visible, which is also why a `save=true` value can always be inserted and any concurrent Put or Delete of that key linearizes after it.
 
 Each operation has exactly one linearization point—a single atomic instruction where the operation "takes effect." All other work (scanning, retrying, cleanup) happens around this point but doesn't affect linearizability.
 

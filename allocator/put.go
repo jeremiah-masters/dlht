@@ -35,7 +35,7 @@ retry:
 		goto retry
 	}
 
-	bitmap := m.matchPrimaryBucketKeys(pb, h0, hash)
+	bitmap := m.matchPrimaryBucketKeys(pb, h0.validMask3(), hash)
 
 	var targetSlot *Slot[K, V]
 	var targetIdx int

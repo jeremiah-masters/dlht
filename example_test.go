@@ -60,6 +60,42 @@ func Example() {
 	// Map has 64 bins with load factor 0.002
 }
 
+// ExampleMap_LoadOrCompute demonstrates computing a value only when the key
+// is absent. fn runs at most once per key at a time, and a computed
+// (save=true) value is always inserted: racing callers wait and load it.
+func ExampleMap_LoadOrCompute() {
+	m := dlht.New[string, int](dlht.Options{InitialSize: 64})
+
+	calls := 0
+	expensive := func() (int, bool) {
+		calls++
+		return 42, true // save the computed value
+	}
+
+	// Absent: fn runs, the value is inserted.
+	if v, loaded := m.LoadOrCompute("answer", expensive); !loaded {
+		fmt.Printf("computed: %d\n", v)
+	}
+
+	// Present: fn does not run, the existing value is returned.
+	if v, loaded := m.LoadOrCompute("answer", expensive); loaded {
+		fmt.Printf("loaded: %d\n", v)
+	}
+
+	fmt.Printf("fn calls: %d\n", calls)
+
+	// A save=false return computes without inserting.
+	v, _ := m.LoadOrCompute("probe", func() (int, bool) { return 7, false })
+	_, found := m.Get("probe")
+	fmt.Printf("probe computed %d, stored: %v\n", v, found)
+
+	// Output:
+	// computed: 42
+	// loaded: 42
+	// fn calls: 1
+	// probe computed 7, stored: false
+}
+
 // Example_concurrent demonstrates concurrent usage of DLHT
 func Example_concurrent() {
 	m := dlht.New[uint64, string](dlht.Options{InitialSize: 32})

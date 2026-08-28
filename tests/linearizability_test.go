@@ -79,6 +79,48 @@ var linearizabilityTestConfigs = []TestConfig{
 		ContentionLevel: "low",
 		Description:     "Tests scalability with many clients and keys",
 	},
+	// OpDistribution indices 4, 5 and 6 are LoadOrCompute with save=true,
+	// save=false, and a save=true fn that yields first (selectOperation).
+	{
+		Name:            "LoadOrComputeRace",
+		NumClients:      8,
+		NumOpsPerClient: 50,
+		NumKeys:         2, // High contention: racing computes and inserts of the same key
+		InitialSize:     4,
+		OpDistribution:  []float64{0.1, 0.1, 0.05, 0.15, 0.5, 0.1},
+		ContentionLevel: "high",
+		Description:     "Racing LoadOrCompute, Insert and Delete of the same keys",
+	},
+	{
+		Name:            "LoadOrComputeAbortHeavy",
+		NumClients:      8,
+		NumOpsPerClient: 100,
+		NumKeys:         4,
+		InitialSize:     4,
+		OpDistribution:  []float64{0.15, 0.1, 0.05, 0.2, 0.2, 0.3},
+		ContentionLevel: "high",
+		Description:     "save=false computes racing computes, inserts and deletes: waiters recompute after aborts",
+	},
+	{
+		Name:            "MixedWithLoadOrCompute",
+		NumClients:      12,
+		NumOpsPerClient: 200,
+		NumKeys:         20,
+		InitialSize:     16,
+		OpDistribution:  []float64{0.3, 0.15, 0.15, 0.1, 0.25, 0.05},
+		ContentionLevel: "medium",
+		Description:     "Realistic mixed workload including LoadOrCompute",
+	},
+	{
+		Name:            "LoadOrComputeGrowth",
+		NumClients:      12,
+		NumOpsPerClient: 150,
+		NumKeys:         200,
+		InitialSize:     1, // One bin, no link arena: the table resizes repeatedly while claims are pending
+		OpDistribution:  []float64{0.2, 0.15, 0.1, 0.15, 0.15, 0.05, 0.2},
+		ContentionLevel: "medium",
+		Description:     "Compute-heavy growth from a one-bin table: slow computes keep claims open across the resizes that carry them",
+	},
 }
 
 var workloadPatterns = []WorkloadPattern{
@@ -93,6 +135,28 @@ var workloadPatterns = []WorkloadPattern{
 				return DLHTInput{OpInsert, key, value}
 			}
 			return DLHTInput{OpGet, key, 0}
+		},
+	},
+	{
+		Name:        "SameKeyCompute",
+		Description: "Multiple clients computing the same key simultaneously, with deletes so it recurs",
+		Generator: func(clientId, opId int, config TestConfig) DLHTInput {
+			key := fmt.Sprintf("race_key_%d", opId%max(1, config.NumKeys))
+			value := clientId*1000 + opId
+
+			r := rand.Float64()
+			switch {
+			case r < 0.4:
+				return DLHTInput{OpLoadOrCompute, key, value}
+			case r < 0.5:
+				return DLHTInput{OpLoadOrComputeNoSave, key, value}
+			case r < 0.6:
+				return DLHTInput{OpLoadOrComputeSlow, key, value}
+			case r < 0.8:
+				return DLHTInput{OpDelete, key, 0}
+			default:
+				return DLHTInput{OpGet, key, 0}
+			}
 		},
 	},
 	{
@@ -256,6 +320,7 @@ func buildContentionOpSequences() []opSequence {
 		{"Get", OpGet},
 		{"Put", OpPut},
 		{"Delete", OpDelete},
+		{"LoadOrCompute", OpLoadOrCompute},
 	}
 
 	var sequences []opSequence
@@ -277,6 +342,24 @@ func buildContentionOpSequences() []opSequence {
 			Ops:  []int{OpDelete, OpInsert, tail.op},
 		})
 	}
+
+	// Insert racing a compute of the same key: whichever wins, the other must
+	// observe it; the Delete keeps the key cycling between absent and present.
+	sequences = append(sequences, opSequence{
+		Name: "DeleteInsertThenLoadOrComputeThenInsert",
+		Ops:  []int{OpDelete, OpInsert, OpLoadOrCompute, OpInsert},
+	})
+
+	// save=false computes: an aborting compute racing a saving one (the waiter
+	// must recompute after the abort), and an abort racing a Delete.
+	sequences = append(sequences, opSequence{
+		Name: "DeleteLoadOrComputeNoSaveThenLoadOrCompute",
+		Ops:  []int{OpDelete, OpLoadOrComputeNoSave, OpLoadOrCompute},
+	})
+	sequences = append(sequences, opSequence{
+		Name: "LoadOrComputeNoSaveThenDelete",
+		Ops:  []int{OpLoadOrComputeNoSave, OpDelete},
+	})
 
 	return sequences
 }

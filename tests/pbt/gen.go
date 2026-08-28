@@ -13,6 +13,8 @@ const (
 	OpInsert
 	OpPut
 	OpDelete
+	OpLoadOrCompute       // fn returns (Value, save=true)
+	OpLoadOrComputeNoSave // fn returns (Value, save=false)
 )
 
 func (k OpKind) String() string {
@@ -25,6 +27,10 @@ func (k OpKind) String() string {
 		return "Put"
 	case OpDelete:
 		return "Delete"
+	case OpLoadOrCompute:
+		return "LoadOrCompute"
+	case OpLoadOrComputeNoSave:
+		return "LoadOrComputeNoSave"
 	default:
 		return fmt.Sprintf("Unknown(%d)", k)
 	}
@@ -37,19 +43,25 @@ type Op[K comparable, V any] struct {
 }
 
 type OpMix struct {
-	Get    int
-	Insert int
-	Put    int
-	Delete int
+	Get           int
+	Insert        int
+	Put           int
+	Delete        int
+	Compute       int // LoadOrCompute with save=true
+	ComputeNoSave int // LoadOrCompute with save=false
 }
 
 var (
 	MixBalanced = OpMix{Get: 25, Insert: 25, Put: 25, Delete: 25}
 	MixChurn    = OpMix{Get: 10, Insert: 30, Put: 30, Delete: 30}
+	// MixCompute keeps keys flipping between absent and present so
+	// LoadOrCompute meets both outcomes, with Insert racing it for the
+	// absent->present transition.
+	MixCompute = OpMix{Get: 10, Insert: 15, Put: 10, Delete: 30, Compute: 25, ComputeNoSave: 10}
 )
 
 func (m OpMix) total() int {
-	return m.Get + m.Insert + m.Put + m.Delete
+	return m.Get + m.Insert + m.Put + m.Delete + m.Compute + m.ComputeNoSave
 }
 
 func (m OpMix) normalized() OpMix {
@@ -73,7 +85,15 @@ func DrawOpKind(t *rapid.T, mix OpMix) OpKind {
 	if r < m.Put {
 		return OpPut
 	}
-	return OpDelete
+	r -= m.Put
+	if r < m.Delete {
+		return OpDelete
+	}
+	r -= m.Delete
+	if r < m.Compute {
+		return OpLoadOrCompute
+	}
+	return OpLoadOrComputeNoSave
 }
 
 func GenStringKey(keyspace int) *rapid.Generator[string] {
@@ -154,7 +174,7 @@ func GenOp[K comparable, V any](keyGen *rapid.Generator[K], valGen *rapid.Genera
 		kind := DrawOpKind(t, mix)
 		key := keyGen.Draw(t, "key")
 		var value V
-		if kind == OpInsert || kind == OpPut {
+		if kind != OpGet && kind != OpDelete {
 			value = valGen.Draw(t, "value")
 		}
 		return Op[K, V]{Kind: kind, Key: key, Value: value}

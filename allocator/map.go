@@ -91,15 +91,17 @@ func (m *Map[K, V]) Size() uint64 {
 // validSlotCount sums Valid slots across all primary bins via one
 // atomic header load per bin.
 //
-// Slot states pack as 15 * 2 bits in [29:0]: Valid=0b10, Trying=0b01,
-// Invalid=0b00. The mask 0x2AAAAAAA has the high bit of each pair set
-// (positions 1, 3, ..., 29); popcount of h & mask counts valid slots.
+// Slot states pack as 15 * 2 bits in [29:0]: Valid=0b11, Shadow=0b10,
+// Trying=0b01, Invalid=0b00. Valid is matched exactly (both bits set) so
+// pending LoadOrCompute claims (Shadow) are not counted: the key is not
+// present until the claim commits.
 func (idx *index[K, V]) validSlotCount() uint64 {
-	const validMask uint32 = 0x2AAAAAAA
+	const lowBits uint32 = 0x15555555 // low bit of each of the 15 pairs
 	var n uint64
 	for i := range idx.bins {
 		h := atomicLoadHeader(&idx.bins[i].Header)
-		n += uint64(bits.OnesCount32(uint32(h) & validMask))
+		s := uint32(h)
+		n += uint64(bits.OnesCount32((s & (s >> 1)) & lowBits))
 	}
 	return n
 }

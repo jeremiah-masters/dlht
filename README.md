@@ -1,10 +1,10 @@
 # DLHT
 
-DLHT is a high-performance, lock-free hash table for high-concurrency workloads based on DLHT: A Non-blocking Resizable Hashtable with Fast Deletes and Memory-awareness (<https://arxiv.org/abs/2406.09986>). It provides lock-free Get, Insert, Delete, and Put operations with sophisticated memory ordering and cooperative resizing.
+DLHT is a high-performance, lock-free hash table for high-concurrency workloads based on DLHT: A Non-blocking Resizable Hashtable with Fast Deletes and Memory-awareness (<https://arxiv.org/abs/2406.09986>). It provides lock-free Get, Insert, Delete, and Put operations, plus LoadOrCompute (a compute-if-absent whose value function runs at most once per key at a time; same-key writers wait for it), with sophisticated memory ordering and cooperative resizing.
 
 ## Features
 
-- **Lock-free operations**: All operations (Get, Insert, Delete, Put) are lock-free and linearizable
+- **Lock-free operations**: Get, Insert, Delete, and Put are lock-free and linearizable; LoadOrCompute is linearizable and blocks only same-key writers, only while its value function runs
 - **High concurrency**: Scales well with multiple threads and cores
 - **Automatic resizing**: Cooperative resize algorithm that doesn't block operations
 - **Memory efficient**: Cache-line optimized data structures with bounded overflow
@@ -36,6 +36,12 @@ func main() {
     // Update values atomically
     if oldValue, updated := m.Put("apple", 10); updated {
         fmt.Printf("Updated apple: %d -> %d\n", oldValue, 10)
+    }
+
+    // Compute a value only if the key is absent; fn runs at most once per key
+    // even when callers race, and its result is inserted before it returns
+    if value, loaded := m.LoadOrCompute("cherry", func() (int, bool) { return 8, true }); !loaded {
+        fmt.Printf("Computed cherry = %d\n", value)
     }
 
     // Delete keys
@@ -74,6 +80,7 @@ func main() {
 - `Get(key K) (V, bool)`: Get a value by key
 - `Insert(key K, value V) (V, bool)`: Insert a new key-value pair
 - `Put(key K, value V) (V, bool)`: Update an existing key atomically
+- `LoadOrCompute(key K, fn func() (V, bool)) (V, bool)`: Return the existing value, or call `fn` once to compute one; a `save=true` result is inserted. Concurrent Insert/LoadOrCompute callers of an absent key wait for the one running `fn`, so `fn` runs at most once at a time per key; keep `fn` short and never Insert/LoadOrCompute the same key inside it
 - `Delete(key K) (V, bool)`: Delete a key and return the old value
 - `Size() uint64`: Approximate count of valid entries
 - `Stats() Stats`: Get current statistics
@@ -114,4 +121,4 @@ Panels cover read-only reads, insert/delete churn, a put-heavy mix, and rapid gr
 
 ## License
 
-Licensed under Apache v2.
+Apache 2.0. See [LICENSE](LICENSE).

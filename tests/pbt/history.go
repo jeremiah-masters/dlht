@@ -4,9 +4,10 @@ import "sync/atomic"
 
 // OpResult is the observed outcome of one map operation.
 type OpResult[V any] struct {
-	Found   bool
-	Value   V
-	Updated bool
+	Found    bool
+	Value    V
+	Updated  bool
+	Computed bool // LoadOrCompute only: fn ran (exactly once)
 }
 
 // TimedOp is one operation with its observed result and real-time interval.
