@@ -121,8 +121,7 @@ func TestLoadOrCompute_AfterDelete(t *testing.T) {
 	}
 }
 
-// A claim placed past the primary slots (bin pre-filled) lands in a link slot
-// and behaves identically.
+// Fill the primary slots so the claim uses a link slot.
 func TestLoadOrCompute_LinkSlotClaim(t *testing.T) {
 	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
 	keys := keysForBin(testSeed, 15, 0, 4, 1<<22)
@@ -167,9 +166,8 @@ func TestLoadOrCompute_LinkSlotClaim(t *testing.T) {
 	}
 }
 
-// A full bin (7 slots on a fresh 16-bin index: 3 primary + 4 single-link;
-// the pair allocation fails on the 2-bucket arena) forces LoadOrCompute down
-// the triggerResize path, and the compute lands on the new index.
+// A 16-bin index has room for 3 primary slots and one 4-slot link in this
+// bin. The pair allocation fails, forcing the next insertion to resize.
 func TestLoadOrCompute_TriggersResizeWhenFull(t *testing.T) {
 	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
 	keys := keysForBin(testSeed, 15, 0, 8, 1<<22)
@@ -244,11 +242,8 @@ func TestLoadOrCompute_InvisibleWhileClaimHeld(t *testing.T) {
 	}
 }
 
-// startGate releases a fixed number of goroutines at the same instant so
-// that operations of a few hundred nanoseconds really overlap. A channel gate
-// wakes the waiters one scheduler hop apart, and by then the first one has
-// usually finished; spinning waiters observe the release within nanoseconds
-// of each other. Falls back to yielding when there are not enough Ps to spin.
+// startGate releases waiting goroutines together to encourage overlapping
+// operations. Waiters yield unless there are enough Ps for all of them to spin.
 type startGate struct {
 	n     int32
 	spin  bool
@@ -270,7 +265,7 @@ func (g *startGate) wait() {
 	}
 }
 
-// release waits for all n goroutines to be spinning, then lets them go.
+// release waits for all n goroutines to reach the gate, then opens it.
 func (g *startGate) release() {
 	for g.ready.Load() < g.n {
 		runtime.Gosched()
@@ -278,8 +273,7 @@ func (g *startGate) release() {
 	g.open.Store(true)
 }
 
-// countValidSlotsForHash counts, at quiescence, the Valid slots in hash's bin
-// whose key word matches hash: the liveKeyUniquePerBin duplicate detector.
+// countValidSlotsForHash counts matching Valid slots after all writers stop.
 func countValidSlotsForHash(m *Map[uint64, uint64], hash uint64) int {
 	idx := m.getActiveIndex()
 	pb := idx.getBin(hash)
@@ -296,16 +290,9 @@ func countValidSlotsForHash(m *Map[uint64, uint64], hash uint64) int {
 	return n
 }
 
-// Hammers the load-bearing retryWithSlot Shadow back-off site (insert.go):
-// an Insert that already holds a Trying reservation re-finalizes against a
-// FRESH header, so a LoadOrCompute claim published inside Insert's
-// reserve->finalize window is only excluded by that site's explicit check.
-// Without it, Insert finalizes past the claim and the holder's commit
-// duplicates the key. A churn goroutine bumps the bin header to force
-// Inserts into the retry path; the white-box detector asserts at most one
-// Valid slot per hash after each quiescent round. (Validated by mutation:
-// removing the retryWithSlot check makes this fail within a few thousand
-// rounds.)
+// Insert must rescan for claims after a failed finalize CAS. Otherwise a
+// claim published after its reservation can lead to duplicate Valid slots.
+// Churn in the same bin increases the chance of taking this retry path.
 func TestLoadOrCompute_InsertRetryWithSlotMeetsClaim(t *testing.T) {
 	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
 	keys := keysForBin(testSeed, 15, 0, 2, 1<<22)
@@ -333,8 +320,7 @@ func TestLoadOrCompute_InsertRetryWithSlotMeetsClaim(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			gate.wait()
-			// Header churn on the same bin widens Insert's finalize-failure
-			// window without ever holding k itself.
+			// Change the bin header without writing k.
 			m.Insert(churnKey, 3)
 			m.Delete(churnKey)
 		}()
@@ -350,10 +336,8 @@ func TestLoadOrCompute_InsertRetryWithSlotMeetsClaim(t *testing.T) {
 	}
 }
 
-// Pins the transient mid-commit window: a Shadow slot whose entry has
-// already been release-stored but whose commit CAS has not landed. The
-// exact-Valid masks are what keep every reader from surfacing that entry;
-// this installs the window state by hand and checks all of them.
+// An entry stored before the commit CAS must remain invisible while its
+// slot is Shadow. Construct that intermediate state directly.
 func TestLoadOrCompute_ShadowWithEntryInvisibleMidCommit(t *testing.T) {
 	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
 	const k = uint64(7)
@@ -363,8 +347,7 @@ func TestLoadOrCompute_ShadowWithEntryInvisibleMidCommit(t *testing.T) {
 	idx := m.getActiveIndex()
 	pb := idx.getBin(hash)
 
-	// Reserve -> fill -> publish -> release-store: LC3..LC5 plus the first
-	// half of the commit, stopped just before the Shadow->Valid CAS.
+	// Publish a claim and store its entry without committing.
 	h0 := atomicLoadHeader(&pb.Header)
 	h1 := h0.setSlotStateAndVersion(0, SlotTrying)
 	if !atomicCASHeader(&pb.Header, h0, h1) {
@@ -400,7 +383,7 @@ func TestLoadOrCompute_ShadowWithEntryInvisibleMidCommit(t *testing.T) {
 		return true
 	})
 
-	// Land the commit CAS; the entry becomes visible everywhere.
+	// Commit the entry and check that it is visible.
 	if !atomicCASHeader(&pb.Header, h2, h2.setSlotStateAndVersion(0, SlotValid)) {
 		t.Fatal("commit CAS failed on a quiescent bin")
 	}
@@ -412,8 +395,7 @@ func TestLoadOrCompute_ShadowWithEntryInvisibleMidCommit(t *testing.T) {
 	}
 }
 
-// With save=true and no deletes, fn runs exactly once per key no matter how
-// many goroutines race, and every racer converges on the winner's value.
+// With save=true and no deletes, racing callers share one computation.
 func TestLoadOrCompute_FnOnceUnderContention(t *testing.T) {
 	const goroutines = 32
 	m := New[uint64, uint64](Options{InitialSize: 16})
@@ -595,8 +577,7 @@ func TestLoadOrCompute_WaiterLoadsAfterCommit(t *testing.T) {
 	}
 }
 
-// After a save=false abort the waiting LoadOrCompute runs its own fn: a
-// second compute after an abort is the spec's legitimate outcome.
+// After a save=false abort, the waiting LoadOrCompute runs its own fn.
 func TestLoadOrCompute_WaiterComputesAfterAbort(t *testing.T) {
 	m := New[uint64, uint64](Options{InitialSize: 16})
 
@@ -641,9 +622,7 @@ func TestLoadOrCompute_WaiterComputesAfterAbort(t *testing.T) {
 	}
 }
 
-// A resize completing while fn runs must carry the claim (key only, no
-// sentinel, nil entry) into the new index; the holder relocates and commits
-// there.
+// Resize carries a pending claim by hash; the holder commits in the new index.
 func TestLoadOrCompute_CommitAfterResize(t *testing.T) {
 	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
 	const key = uint64(42)
@@ -679,8 +658,7 @@ func TestLoadOrCompute_CommitAfterResize(t *testing.T) {
 		t.Fatal("resize did not swap the active index")
 	}
 
-	// Old bin dead; the claim's slot key must NOT have been sentineled or
-	// moved as an entry: the carry copies the key and leaves the slot alone.
+	// Carrying a claim leaves its old hash intact, without a sentinel.
 	if st := atomicLoadHeader(&oldPb.Header).getBinState(); st != BinDoneTransfer {
 		t.Fatalf("old bin state: got %d, want BinDoneTransfer", st)
 	}
@@ -758,9 +736,7 @@ func TestLoadOrCompute_AbortAfterResize(t *testing.T) {
 	}
 }
 
-// Two full resizes while the holder is parked: the claim is carried twice and
-// the holder walks both generations to commit (the spec's double-relocation
-// scenario).
+// The holder follows its claim across two resizes before committing.
 func TestLoadOrCompute_DoubleRelocation(t *testing.T) {
 	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
 	const key = uint64(42)
@@ -850,11 +826,7 @@ func TestLoadOrCompute_LinkClaimCarriedAcrossResize(t *testing.T) {
 	}
 }
 
-// No panic containment exists around fn: a panicking fn orphans its claim
-// (LoadOrCompute's documented sharp edge). The supported pattern for
-// fallible fns is recovering INSIDE fn, where the named returns stay
-// (zero, false) and the claim aborts cleanly. This pins the pattern the doc
-// comment prescribes.
+// Recover inside fn so its zero-valued named returns abort the claim.
 func TestLoadOrCompute_RecoverInsideFnPattern(t *testing.T) {
 	m := New[uint64, uint64](Options{InitialSize: 16})
 
@@ -869,7 +841,7 @@ func TestLoadOrCompute_RecoverInsideFnPattern(t *testing.T) {
 		t.Fatal("key visible after an aborted (recovered) compute")
 	}
 
-	// The abort released the claim: the key is not wedged.
+	// The abort released the claim.
 	if v, loaded := m.LoadOrCompute(12, func() (uint64, bool) { return 9, true }); loaded || v != 9 {
 		t.Fatalf("recompute: got (%d, %v), want (9, false)", v, loaded)
 	}
@@ -878,11 +850,9 @@ func TestLoadOrCompute_RecoverInsideFnPattern(t *testing.T) {
 	}
 }
 
-// An unrecovered panic propagates to the caller and orphans the claim.
-// Insert or LoadOrCompute of the key would spin forever (not asserted: that
-// is the documented consequence, not a behavior to pin); readers never wait
-// on a claim, so they keep seeing the key as absent and the rest of the map
-// stays fully usable.
+// An unrecovered panic propagates and leaves the claim pending. Readers
+// still see the key as absent. Avoid Insert and LoadOrCompute on that hash:
+// they would wait indefinitely.
 func TestLoadOrCompute_UnrecoveredPanicPropagates(t *testing.T) {
 	m := New[uint64, uint64](Options{InitialSize: 16})
 	m.Insert(1000, 1)
@@ -911,9 +881,7 @@ func TestLoadOrCompute_UnrecoveredPanicPropagates(t *testing.T) {
 	}
 }
 
-// Per-key fn-once under multi-key contention with resizes forced mid-flight:
-// every key's fn runs exactly once (save=true, no deletes), every caller of a
-// key returns its committed value, and the final table is complete.
+// Concurrent callers share one computation per key while the table resizes.
 func TestLoadOrCompute_StressWithResizes(t *testing.T) {
 	const (
 		goroutines = 16
@@ -979,7 +947,7 @@ func TestLoadOrCompute_StressWithResizes(t *testing.T) {
 	}
 }
 
-// The hit path should track BenchmarkGetHit: same scan, same seqlock, no fn.
+// Compare the existing-key path with BenchmarkGetHit.
 func BenchmarkLoadOrComputeHit(b *testing.B) {
 	keys := benchKeys()
 	m := prefilledMap(keys)
@@ -992,8 +960,7 @@ func BenchmarkLoadOrComputeHit(b *testing.B) {
 	}
 }
 
-// The compute path pays reserve + publish + commit (one CAS more than
-// Insert's reserve + finalize) plus the entry allocation.
+// A successful compute reserves, publishes, and commits before deletion.
 func BenchmarkLoadOrComputeCompute(b *testing.B) {
 	keys := benchKeys()
 	m := prefilledMap(keys)
@@ -1069,15 +1036,9 @@ func TestHeaderMasks_ShadowExactness(t *testing.T) {
 	}
 }
 
-// Hammers LoadOrCompute's own keep-slot path: a publish CAS that fails
-// (header churn between reserve and publish) keeps the Trying slot and
-// re-publishes under a fresh header, so a same-key Insert that landed in the
-// window, or a same-key claim another LoadOrCompute published in it, is only
-// excluded by that path's rescans. Two computes and one Insert race per round
-// under header churn; afterwards exactly one Valid slot may hold the hash, fn
-// ran at most once, and whichever writer won is the value every caller saw.
-// A save=true fn that ran must have been inserted (the guaranteed-insertion
-// contract), so the map value is the compute's whenever fn ran.
+// After a failed publish CAS, LoadOrCompute must rescan for both entries and
+// claims. Race two computes with an Insert under header churn, then check
+// that one writer won, all callers agree, and no computed value was discarded.
 func TestLoadOrCompute_PublishRetryMeetsInsertOrClaim(t *testing.T) {
 	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
 	keys := keysForBin(testSeed, 15, 0, 2, 1<<22)
@@ -1113,8 +1074,7 @@ func TestLoadOrCompute_PublishRetryMeetsInsertOrClaim(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			gate.wait()
-			// Header churn on the same bin widens the reserve->publish
-			// window without ever holding k itself.
+			// Change the bin header without writing k.
 			m.Insert(churnKey, 3)
 			m.Delete(churnKey)
 		}()
@@ -1158,9 +1118,7 @@ func TestLoadOrCompute_PublishRetryMeetsInsertOrClaim(t *testing.T) {
 	}
 }
 
-// fn itself may write other keys, including enough of them to fill a bin and
-// run a resize from inside the claim window (helpResize then transfers the
-// holder's own bin, carrying its claim). The holder relocates and commits.
+// A resize triggered inside fn must carry the caller's own claim.
 func TestLoadOrCompute_ResizeTriggeredInsideFn(t *testing.T) {
 	m := New[uint64, uint64](Options{InitialSize: 16})
 	oldIdx := m.getActiveIndex()
@@ -1194,7 +1152,7 @@ func TestLoadOrCompute_ResizeTriggeredInsideFn(t *testing.T) {
 	}
 }
 
-// A LoadOrCompute of a different key inside fn is fine, even in the same bin.
+// A nested compute with a different hash can use the same bin.
 func TestLoadOrCompute_NestedComputeOfOtherKey(t *testing.T) {
 	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
 	keys := keysForBin(testSeed, 15, 0, 2, 1<<22)

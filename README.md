@@ -1,10 +1,10 @@
 # DLHT
 
-DLHT is a high-performance, lock-free hash table for high-concurrency workloads based on DLHT: A Non-blocking Resizable Hashtable with Fast Deletes and Memory-awareness (<https://arxiv.org/abs/2406.09986>). It provides lock-free Get, Insert, Delete, and Put operations, plus LoadOrCompute (a compute-if-absent whose value function runs at most once per key at a time; same-key Insert and LoadOrCompute callers wait for it), with sophisticated memory ordering and cooperative resizing.
+DLHT is a high-performance hash table for high-concurrency workloads based on DLHT: A Non-blocking Resizable Hashtable with Fast Deletes and Memory-awareness (<https://arxiv.org/abs/2406.09986>). It provides Get, Insert, Delete, Put, and LoadOrCompute operations with cooperative resizing.
 
 ## Features
 
-- **Lock-free operations**: Get, Insert, Delete, and Put are lock-free and linearizable; LoadOrCompute is linearizable and blocks only same-key Insert and LoadOrCompute callers, only while its value function runs (Get, Put, Delete, and Range never wait; they see the key as absent until it commits)
+- **Linearizable operations**: Get, Insert, Delete, Put, and LoadOrCompute are linearizable. Get, Put, and Delete are lock-free; Insert and LoadOrCompute wait for pending computes with the same 64-bit hash
 - **High concurrency**: Scales well with multiple threads and cores
 - **Automatic resizing**: Cooperative resize algorithm that doesn't block operations
 - **Memory efficient**: Cache-line optimized data structures with bounded overflow
@@ -38,8 +38,7 @@ func main() {
         fmt.Printf("Updated apple: %d -> %d\n", oldValue, 10)
     }
 
-    // Compute a value only if the key is absent; fn runs at most once per key
-    // even when callers race, and its result is inserted before it returns
+    // Compute and insert a value if the key is absent
     if value, loaded := m.LoadOrCompute("cherry", func() (int, bool) { return 8, true }); !loaded {
         fmt.Printf("Computed cherry = %d\n", value)
     }
@@ -80,7 +79,7 @@ func main() {
 - `Get(key K) (V, bool)`: Get a value by key
 - `Insert(key K, value V) (V, bool)`: Insert a new key-value pair
 - `Put(key K, value V) (V, bool)`: Update an existing key atomically
-- `LoadOrCompute(key K, fn func() (V, bool)) (V, bool)`: Return the existing value, or call `fn` once to compute one; a `save=true` result is inserted. Concurrent Insert/LoadOrCompute callers of an absent key wait for the one running `fn`, so `fn` runs at most once at a time per key; keep `fn` short and never Insert/LoadOrCompute the same key inside it
+- `LoadOrCompute(key K, fn func() (V, bool)) (V, bool)`: Return the existing value with `loaded=true`, or call `fn` and return its value with `loaded=false`. The computed value is inserted if `fn` returns `save=true`
 - `Delete(key K) (V, bool)`: Delete a key and return the old value
 - `Size() uint64`: Approximate count of valid entries
 - `Stats() Stats`: Get current statistics
@@ -88,6 +87,10 @@ func main() {
 - `All() iter.Seq2[K, V]`: Range adapter for `for k, v := range m.All()`
 - `Keys() iter.Seq[K]`: Range over keys only
 - `Values() iter.Seq[V]`: Range over values only
+
+LoadOrCompute serializes computes for each 64-bit hash. Insert and LoadOrCompute callers of an absent key wait for a pending compute with that hash; Get, Put, Delete, and Range treat the pending key as absent. A `save=true` result is inserted before LoadOrCompute returns. Once inserted, a concurrent Put or Delete can change it before the call returns.
+
+Keep `fn` short and let it return normally. A panic or `runtime.Goexit` leaves its claim pending, so later Insert and LoadOrCompute calls with that hash can wait forever. Recover inside `fn` and return `save=false` to release the claim after a panic. Within `fn`, do not Insert or LoadOrCompute the same key or another key with the same hash, and avoid cyclic waits between callbacks.
 
 ## Implementation Details
 
@@ -100,7 +103,7 @@ This package provides a clean public API that wraps the allocator-based implemen
 
 DLHT is designed for high-performance concurrent workloads:
 
-- **Lock-free**: No blocking between operations
+- **Lock-free reads and updates**: Get, Put, and Delete do not wait for value functions
 - **Cache-optimized**: 64-byte buckets fit exactly in cache lines
 - **Bounded overflow**: Maximum 15 slots per bucket for predictable performance
 - **Cooperative resizing**: Non-blocking resize with work-stealing

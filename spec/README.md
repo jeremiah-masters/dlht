@@ -176,24 +176,14 @@ stage-1a evidence tier is described below.
   anchored-refinement results continue to hold on the maxGen=0 configs
   (re-verified; `rsInvPure` additions are inert there by `genTopology`).
 - **The keep-slot retry paths (Insert finalize, LoadOrCompute publish)**: on
-  finalize failure, the Go implementation (`allocator/insert.go`,
-  `retryWithSlot`) KEEPS its `Trying` reservation, re-scans under a fresh
-  header `h2`, and re-finalizes with `h2` as the CAS expectation; the spec
-  models unreserve-and-restart (I6 → I1) instead. `LoadOrCompute` does the
-  same on publish failure (`allocator/loadorcompute.go`, `retryWithSlot`):
-  re-scan under `h2` (key present → unreserve, return it; another Shadow claim
-  on the hash → unreserve, back off), then re-publish Trying → Shadow with
-  `h2` as the expectation, where the spec models LC8 (unreserve) → LC1. Both
-  are sound coarsenings for linearizability — every keep-slot outcome maps to
-  an unreserve+retry execution with identical abstract behavior (a Trying slot
-  is inert to every other proc, and the CAS-against-`h2` re-establishes the
-  I2/LC2 preconditions atomically) — but the re-finalize/re-publish-under-
-  fresh-header edges themselves are NOT machine-verified. Their correctness
-  rests on the header's ABA-freedom: versions only grow, and the only
-  version-silent header writes (D8's AND, the InTransfer OR, the Done store)
-  cannot recreate a prior bit pattern without intervening bumps. Modeling them
-  (new PCs I7/I8, LC11/LC12 + anchor/`allPCs`/space-table growth + full
-  re-verification) is a candidate next work item.
+  CAS failure, Go keeps the `Trying` reservation and rescans under a fresh
+  header. It releases the slot if the key now exists or another claim holds
+  the hash; otherwise it retries the CAS against that header. The spec models
+  unreserve-and-restart (I6 → I1 and LC8 → LC1), so these Go retry paths are
+  not machine-verified. They require the rescan and CAS to use the same
+  header, including its version and bin state. Modeling the retry paths and
+  re-verifying their refinement remains future work; the version-wraparound
+  limit below also applies.
 - **Entry pointer identity assumes GC no-reuse**: `slotTag`/`nextTag` model each
   entry pointer as never reused — sound for Go (a parked op's captured `*Entry`
   keeps the object reachable, so the allocator can't recycle it while a DWCAS

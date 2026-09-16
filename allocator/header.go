@@ -6,20 +6,16 @@ import (
 )
 
 const (
-	versionShift   = 32
-	binStateShift  = 30
-	binStateMask   = 0x3 << binStateShift
-	slotStatesMask = (1 << 30) - 1
+	versionShift  = 32
+	binStateShift = 30
+	binStateMask  = 0x3 << binStateShift
 )
 
 func (h Header) getBinState() uint8 { return uint8((uint64(h) & binStateMask) >> binStateShift) }
 
-func (h Header) getSlotStates() uint32 { return uint32(uint64(h) & slotStatesMask) }
-
 func (h Header) getSlotState(slotIdx int) uint8 {
-	s := h.getSlotStates()
-	shift := uint(slotIdx*2) & 63 // prove to compiler shift < 64; elided on both arm64 and amd64
-	return uint8((s >> shift) & 0x3)
+	shift := uint(slotIdx*2) & 63 // slot indices 0..14; bound the shift for the compiler
+	return uint8((uint64(h) >> shift) & 0x3)
 }
 
 func (h Header) setBinState(binState uint8) Header {
@@ -61,10 +57,7 @@ func atomicStoreSlotVal[K Key, V any](slot *Slot[K, V], entry *Entry[K, V]) {
 // Bits are at positions 0, 2, 4 (not compacted to 0, 1, 2). Use bits.TrailingZeros32(mask) >> 1
 // to convert to a slot index.
 //
-// Valid (0b11) is matched exactly: both bits of the pair set. Shadow (0b10)
-// must never appear valid: its entry is nil (or, transiently during commit,
-// not yet published), and treating it as a candidate would let readers
-// return a value before the commit CAS linearizes it.
+// Both bits must be set: Shadow slots can hold an entry before it is published.
 func (h Header) validMask3() uint32 {
 	s := uint32(h)
 	return (s & (s >> 1)) & 0x15
@@ -74,7 +67,7 @@ func (h Header) validMask3() uint32 {
 // Bits are at positions 0, 2, 4, 6 (not compacted to 0, 1, 2, 3). Use bits.TrailingZeros32(mask) >> 1
 // to convert to a slot index relative to base.
 //
-// Valid (0b11) is matched exactly; see validMask3.
+// Both bits must be set, as in validMask3.
 func (h Header) validMask4(base uint) uint32 {
 	s := uint32(h) >> (base << 1)
 	return (s & (s >> 1)) & 0x55
@@ -94,11 +87,8 @@ func (h Header) shadowMask4(base uint) uint32 {
 	return ((s >> 1) &^ s) & 0x55
 }
 
-// shadowMaskAll reports the Shadow slots across all 15 slot-state pairs as a
-// spread bitmask (low bit of each pair: positions 0, 2, ..., 28). Zero means
-// no LoadOrCompute claim anywhere in the bin: the common case, so callers
-// can early-out before resolving any slot. The bin-state bits [31:30] cannot
-// leak in: position 29 (bit 30 shifted right) is not in the mask.
+// shadowMaskAll returns the Shadow slots across the bin, at bits 0, 2, ..., 28.
+// The mask excludes the bin-state bits.
 func (h Header) shadowMaskAll() uint32 {
 	s := uint32(h)
 	return ((s >> 1) &^ s) & 0x15555555
@@ -108,7 +98,7 @@ func (h Header) shadowMaskAll() uint32 {
 // Bits are at positions 0, 2, 4 (not compacted to 0, 1, 2). Use bits.TrailingZeros32(mask) >> 1
 // to convert to a slot index.
 func (h Header) invalidMask3() uint32 {
-	s := uint32(h) & 0x3F
+	s := uint32(h)
 	return ^(s | (s >> 1)) & 0x15
 }
 
@@ -116,7 +106,7 @@ func (h Header) invalidMask3() uint32 {
 // Bits are at positions 0, 2, 4, 6 (not compacted). Use bits.TrailingZeros32(mask) >> 1
 // to convert to a slot index relative to base.
 func (h Header) invalidMask4(base uint) uint32 {
-	s := (uint32(h) >> (base << 1)) & 0xFF
+	s := uint32(h) >> (base << 1)
 	return ^(s | (s >> 1)) & 0x55
 }
 

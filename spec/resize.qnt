@@ -148,10 +148,8 @@ module resize {
     }
   }
 
-  // rsShadowCarry (design §4.3): the carry-forward contract's normative home,
-  // implemented in Go by allocator/resize.go's carryShadowSlots (key only —
-  // the ghost placeholder val + fresh tag below are the spec's Shadow
-  // convention; Go's carried slot keeps a nil entry).
+  // rsShadowCarry (design §4.3) models carryShadowSlots in allocator/resize.go.
+  // Go copies only the hash and leaves the entry nil; val and tag are ghosts.
   // No sentinel: Put/Delete never target Shadow slots.
   action rsShadowCarry = {
     nondet b = binDomain.oneOf()

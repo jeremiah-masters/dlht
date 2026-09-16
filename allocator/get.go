@@ -80,13 +80,8 @@ func (m *Map[K, V]) Contains(key K) bool {
 }
 
 // matchPrimaryBucketKeys returns a spread bitmap of primary slots that are both valid and match the hash.
-// vm3 is the header's exact-Valid mask (validMask3), computed by the caller,
-// mirroring probeLinkBucket's vm4 parameter and keeping this function inside
-// the inlining budget for the Get/Insert/Put/Delete hot paths. The match
-// bitmap has bits only at positions 0, 2, 4, pairing each slot's key match
-// with its validity. Shadow slots must not match (validMask3 excludes them):
-// their entry is unpublished until the commit CAS, so surfacing one as a
-// candidate would break the seqlock's linearization argument.
+// vm3 is the header's validMask3; it must exclude Shadow slots. Computing it
+// in the caller keeps this helper within the compiler's inlining budget.
 func (m *Map[K, V]) matchPrimaryBucketKeys(pb *PrimaryBucket[K, V], vm3 uint32, hash uint64) uint32 {
 	k0 := pb.Slots[0].Key
 	k1 := pb.Slots[1].Key

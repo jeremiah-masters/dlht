@@ -165,13 +165,9 @@ func (m *Map[K, V]) transferBin(ctx *resizeContext[K, V], binIndex uint64) {
 		m.transferValidSlots(ctx, h.validMask4(PRIMARY_SLOTS+2*LINK_SLOTS), ctx.oldIndex.getLinkBucket(p+1).slotAt(0), sentinel)
 	}
 
-	// Carry LoadOrCompute claims (Shadow slots) into the new index: the
-	// claim's key moves while its entry stays nil, because the holder keeps
-	// the value in its locals and commits or aborts against the carried slot
-	// after it relocates (spec/resize.qnt rsShadowCarry). No sentinel is
-	// written: sentinels cut Put/Delete DWCAS races, which cannot target a
-	// Shadow slot, and the claim cannot resolve mid-transfer (its CAS expects
-	// a NoTransfer header), so the snapshot's Shadow set is stable until Done.
+	// Carry claims by hash. The holder keeps the value and resolves the claim
+	// after transfer. Shadow slots need no sentinel: Put/Delete cannot target
+	// them, and the holder's CAS cannot succeed while the bin is transferring.
 	if h.shadowMaskAll() != 0 {
 		m.carryShadowSlots(ctx, h.shadowMask3(), oldBin.slotAt(0))
 		if s := lm.getSingle(); s != NO_LINK {
@@ -210,36 +206,27 @@ func (m *Map[K, V]) transferValidSlots(ctx *resizeContext[K, V], vm uint32, base
 	}
 }
 
-// carryShadowSlots carries every LoadOrCompute claim indicated by the spread
-// bitmask sm (from the pre-OR snapshot header) into the new index. baseSlot
-// points to slot 0 of the bucket.
+// carryShadowSlots copies the snapshot's claims into the new index.
+// sm is a spread bitmask; baseSlot points to slot 0 of the bucket.
 func (m *Map[K, V]) carryShadowSlots(ctx *resizeContext[K, V], sm uint32, baseSlot *Slot[K, V]) {
 	for sm != 0 {
 		slotIdx := bits.TrailingZeros32(sm) >> 1
 		slot := (*Slot[K, V])(unsafe.Add(unsafe.Pointer(baseSlot), uintptr(slotIdx)*unsafe.Sizeof(*baseSlot)))
 
-		// Plain load is coherent: the claim's key was written before the
-		// Shadow publish CAS, which precedes this bin's InTransfer OR in the
-		// header's modification order, and nothing rewrites a Shadow slot's
-		// key (Shadow slots are never sentineled).
+		// The claim's hash was published before transfer and stays fixed
+		// until the bin is done.
 		m.claimIntoNewIndex(ctx, ctx.newIndex, slot.Key)
 
 		sm &= sm - 1
 	}
 }
 
-// claimIntoNewIndex places a carried claim (key only, nil entry) into the
-// new index as a Shadow slot. Mirrors insertIntoNewIndex: plain stores are
-// safe because no operation touches the new bin until the old bin's
-// BinDoneTransfer store publishes it, and the holder only relocates here
-// after observing that store.
+// claimIntoNewIndex installs a claim with no entry. As in insertIntoNewIndex,
+// the old bin's DoneTransfer store publishes these plain writes.
 func (m *Map[K, V]) claimIntoNewIndex(ctx *resizeContext[K, V], idx *index[K, V], hash uint64) {
 	pb := idx.getBin(hash)
 
-	// As for insertIntoNewIndex, this cannot fail: a claim occupies one old
-	// slot and so consumes one unit of the same capacity budget as a valid
-	// entry. Fail loudly if the budget argument is ever broken; the
-	// alternative is an out-of-bounds unsafe write.
+	// Claims use the same resize capacity budget as valid entries.
 	slotIndex := ctx.findFreeSlotOrChain(pb)
 	if slotIndex < 0 {
 		panic("dlht: resize found no free child slot for a carried claim")

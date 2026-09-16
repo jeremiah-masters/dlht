@@ -60,9 +60,7 @@ func Example() {
 	// Map has 64 bins with load factor 0.002
 }
 
-// ExampleMap_LoadOrCompute demonstrates computing a value only when the key
-// is absent. fn runs at most once per key at a time, and a computed
-// (save=true) value is always inserted: racing callers wait and load it.
+// ExampleMap_LoadOrCompute computes a value only when the key is absent.
 func ExampleMap_LoadOrCompute() {
 	m := dlht.New[string, int](dlht.Options{InitialSize: 64})
 
@@ -72,12 +70,12 @@ func ExampleMap_LoadOrCompute() {
 		return 42, true // save the computed value
 	}
 
-	// Absent: fn runs, the value is inserted.
+	// Compute and insert the missing value.
 	if v, loaded := m.LoadOrCompute("answer", expensive); !loaded {
 		fmt.Printf("computed: %d\n", v)
 	}
 
-	// Present: fn does not run, the existing value is returned.
+	// Load the existing value without calling expensive.
 	if v, loaded := m.LoadOrCompute("answer", expensive); loaded {
 		fmt.Printf("loaded: %d\n", v)
 	}

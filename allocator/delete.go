@@ -128,11 +128,9 @@ retry:
 //   - The bit change itself makes h1 ≠ h0 for seqlock readers (Get/Put/Delete).
 //   - ABA is impossible: any Insert re-filling this slot bumps the header version.
 //   - No safety checks are needed: the slot must be Valid (DWCAS just succeeded)
-//     and entry must be nil (DWCAS cleared it). Because it fires only on a
-//     Valid slot, the AND can only ever clear Valid bits, never a Shadow
-//     claim's. The resize daemon is unaffected either way: it walks its
-//     pre-OR snapshot (a local copy this AND cannot change), and a straggler
-//     AND on a dead header is discarded by the DoneTransfer snapshot overwrite.
+//     and entry must be nil (DWCAS cleared it). The slot cannot be reused
+//     until this AND clears it, so it cannot clear a Shadow claim. Resize
+//     uses its saved header snapshot, which this AND cannot change.
 func (m *Map[K, V]) markSlotInvalid(pb *PrimaryBucket[K, V], slotIdx int) {
 	mask := ^(uint64(0x3) << (uint(slotIdx*2) & 63))
 	atomicAndHeader(&pb.Header, mask)

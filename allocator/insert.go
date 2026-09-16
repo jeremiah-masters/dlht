@@ -62,12 +62,7 @@ retry:
 		goto retry
 	}
 
-	// Step 2.1: A Shadow slot holding this hash is a pending LoadOrCompute
-	// claim on this key; back off until the holder resolves it. Reserving a
-	// slot anyway would collide with the holder's commit (duplicate key). A
-	// claim is never abandoned in a live bin (its holder always commits,
-	// aborts, or relocates), so the wait terminates. When no claim exists
-	// anywhere in the bin (the common case) this is a three-instruction test.
+	// Wait for a pending compute with the same hash before reserving a slot.
 	if h0.shadowMaskAll() != 0 {
 		if si, _ := m.findShadowSlot(idx, pb, h0, hash); si >= 0 {
 			m.waitForClaim(idx, pb, hash)
@@ -161,12 +156,8 @@ retryWithSlot:
 		goto retryWithSlot
 	}
 
-	// Same Shadow back-off as Step 2.1. This site is essential: h2 is a
-	// FRESH header, so re-finalizing against it would succeed right past a
-	// LoadOrCompute claim published after our reservation, and the holder's
-	// later commit would duplicate the key. (The spec models this path as
-	// unreserve-and-restart, where the Step 2.1 arm catches it; the keep-slot
-	// retry must re-check on its own.) Give up the slot and wait from the top.
+	// A claim may have appeared since we reserved. Finalizing past it would
+	// duplicate the key when the compute commits.
 	if h2.shadowMaskAll() != 0 {
 		if si, _ := m.findShadowSlot(idx, pb, h2, hash); si >= 0 {
 			m.unreserveSlot(idx, pb, slotIndex)

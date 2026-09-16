@@ -5,10 +5,7 @@ import (
 	"testing"
 )
 
-// Focused single-threaded micro-benchmarks for the core operation paths.
-// Single-threaded on purpose: they isolate instruction-level costs in the
-// scan and claim paths (mask arithmetic, branch structure) that the
-// contended throughput suite in benchmarks/ would drown in coherence noise.
+// Single-threaded benchmarks complement the contention suite in benchmarks/.
 
 const benchKeyspace = 1 << 16
 
@@ -51,9 +48,7 @@ func BenchmarkGetMiss(b *testing.B) {
 	}
 }
 
-// BenchmarkInsertDelete cycles one key through insert-new and delete,
-// exercising the free-slot pick, the claim scan guard, reserve/fill/finalize,
-// and the delete DWCAS + cleanup.
+// BenchmarkInsertDelete inserts and deletes a missing key on each iteration.
 func BenchmarkInsertDelete(b *testing.B) {
 	keys := benchKeys()
 	m := prefilledMap(keys)
@@ -69,7 +64,7 @@ func BenchmarkInsertDelete(b *testing.B) {
 	}
 }
 
-// BenchmarkInsertExisting measures the duplicate-key fast path (scan + return).
+// BenchmarkInsertExisting measures the duplicate-key path.
 func BenchmarkInsertExisting(b *testing.B) {
 	keys := benchKeys()
 	m := prefilledMap(keys)
