@@ -11,7 +11,7 @@ const (
 	binStateMask  = 0x3 << binStateShift
 )
 
-func (h Header) getBinState() uint8 { return uint8((uint64(h) & binStateMask) >> binStateShift) }
+func (h Header) getBinState() uint8 { return uint8(uint32(h) >> binStateShift) }
 
 func (h Header) getSlotState(slotIdx int) uint8 {
 	shift := uint(slotIdx*2) & 63 // slot indices 0..14; bound the shift for the compiler

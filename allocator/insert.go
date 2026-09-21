@@ -65,7 +65,7 @@ retry:
 	// Wait for a pending compute with the same hash before reserving a slot.
 	if h0.shadowMaskAll() != 0 {
 		if si, _ := m.findShadowSlot(idx, pb, h0, hash); si >= 0 {
-			m.waitForClaim(idx, pb, hash)
+			m.waitForClaim(pb, si)
 			goto retry
 		}
 	}
@@ -95,11 +95,6 @@ retry:
 
 	// Step 4.1: Fill the slot
 	slot := idx.getSlotByIndex(pb, slotIndex)
-	if slot == nil {
-		m.unreserveSlot(idx, pb, slotIndex)
-		goto retry
-	}
-
 	slot.Key = hash
 	entry := &Entry[K, V]{Key: key, Value: value}
 	atomicStoreSlotVal(slot, entry) // We must release-store the entry to synchronize with any concurrent reads
@@ -117,7 +112,6 @@ retryWithSlot:
 
 	if h2.getBinState() != BinNoTransfer {
 		if h2.getBinState() == BinDoneTransfer {
-			m.unreserveSlot(idx, pb, slotIndex)
 			idx = idx.getNextIndex()
 			goto retry
 		}
@@ -125,7 +119,6 @@ retryWithSlot:
 		if atomicLoadHeader(&pb.Header).getBinState() == BinInTransfer {
 			runtime.Gosched()
 		}
-		m.unreserveSlot(idx, pb, slotIndex)
 		idx = m.getActiveIndex()
 		goto retry
 	}
@@ -139,7 +132,7 @@ retryWithSlot:
 		if candidate != nil && candidate.Key == key {
 			// Key was inserted by another thread, unreserve our slot and return existing value
 			if h3 := atomicLoadHeader(&pb.Header); h2 == h3 {
-				m.unreserveSlot(idx, pb, slotIndex)
+				m.unreserveSlot(pb, slot, slotIndex)
 				return candidate.Value, false
 			}
 			goto retryWithSlot
@@ -150,7 +143,7 @@ retryWithSlot:
 	// Check if key exists in link buckets
 	if entry := m.scanLinksForKey(idx, pb, h2, key, hash); entry != nil {
 		if h3 := atomicLoadHeader(&pb.Header); h2 == h3 {
-			m.unreserveSlot(idx, pb, slotIndex)
+			m.unreserveSlot(pb, slot, slotIndex)
 			return entry.Value, false
 		}
 		goto retryWithSlot
@@ -160,7 +153,7 @@ retryWithSlot:
 	// duplicate the key when the compute commits.
 	if h2.shadowMaskAll() != 0 {
 		if si, _ := m.findShadowSlot(idx, pb, h2, hash); si >= 0 {
-			m.unreserveSlot(idx, pb, slotIndex)
+			m.unreserveSlot(pb, slot, slotIndex)
 			goto retry
 		}
 	}
@@ -184,22 +177,21 @@ func (m *Map[K, V]) finalizeSlot(pb *PrimaryBucket[K, V], oldH Header, i int) bo
 	return atomicCASHeader(&pb.Header, oldH, newH)
 }
 
-func (m *Map[K, V]) unreserveSlot(idx *index[K, V], pb *PrimaryBucket[K, V], i int) bool {
-	// Unreserve should retry on CAS failures, but must preserve prior updates to the header
+// unreserveSlot releases an owned Trying slot. Pass nil if no entry was stored.
+func (m *Map[K, V]) unreserveSlot(pb *PrimaryBucket[K, V], slot *Slot[K, V], i int) {
 	for {
 		h := atomicLoadHeader(&pb.Header)
-		if h.getSlotState(i) != SlotTrying || h.getBinState() != BinNoTransfer {
-			return false
+		if h.getBinState() != BinNoTransfer {
+			return
 		}
-
-		// We still exclusively own SlotTrying; clear the value before releasing the slot
-		if slot := idx.getSlotByIndex(pb, i); slot != nil {
+		if slot != nil {
 			slot.Val = nil
+			slot = nil
 		}
 
 		newH := h.setSlotStateAndVersion(i, SlotInvalid)
 		if atomicCASHeader(&pb.Header, h, newH) {
-			return true
+			return
 		}
 	}
 }

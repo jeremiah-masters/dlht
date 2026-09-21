@@ -82,7 +82,7 @@ retry:
 	// Wait for a pending compute with the same hash before reserving a slot.
 	if h0.shadowMaskAll() != 0 {
 		if si, _ := m.findShadowSlot(idx, pb, h0, hash); si >= 0 {
-			m.waitForClaim(idx, pb, hash)
+			m.waitForClaim(pb, si)
 			goto retry
 		}
 	}
@@ -112,11 +112,6 @@ retry:
 
 	// The reservation owns the slot until it publishes or releases it.
 	slot := idx.getSlotByIndex(pb, slotIndex)
-	if slot == nil {
-		m.unreserveSlot(idx, pb, slotIndex)
-		goto retry
-	}
-
 	slot.Key = hash
 
 	// Publish the claim before calling fn.
@@ -130,7 +125,6 @@ retryWithSlot:
 
 	if h2.getBinState() != BinNoTransfer {
 		if h2.getBinState() == BinDoneTransfer {
-			m.unreserveSlot(idx, pb, slotIndex)
 			idx = idx.getNextIndex()
 			goto retry
 		}
@@ -138,7 +132,6 @@ retryWithSlot:
 		if atomicLoadHeader(&pb.Header).getBinState() == BinInTransfer {
 			runtime.Gosched()
 		}
-		m.unreserveSlot(idx, pb, slotIndex)
 		idx = m.getActiveIndex()
 		goto retry
 	}
@@ -152,7 +145,7 @@ retryWithSlot:
 		if candidate != nil && candidate.Key == key {
 			// Key was inserted by another thread, unreserve our slot and return existing value
 			if h3 := atomicLoadHeader(&pb.Header); h2 == h3 {
-				m.unreserveSlot(idx, pb, slotIndex)
+				m.unreserveSlot(pb, nil, slotIndex)
 				return candidate.Value, true
 			}
 			goto retryWithSlot
@@ -163,7 +156,7 @@ retryWithSlot:
 	// Check if key exists in link buckets
 	if entry := m.scanLinksForKey(idx, pb, h2, key, hash); entry != nil {
 		if h3 := atomicLoadHeader(&pb.Header); h2 == h3 {
-			m.unreserveSlot(idx, pb, slotIndex)
+			m.unreserveSlot(pb, nil, slotIndex)
 			return entry.Value, true
 		}
 		goto retryWithSlot
@@ -172,7 +165,7 @@ retryWithSlot:
 	// A claim may have appeared since we reserved. Do not publish past it.
 	if h2.shadowMaskAll() != 0 {
 		if si, _ := m.findShadowSlot(idx, pb, h2, hash); si >= 0 {
-			m.unreserveSlot(idx, pb, slotIndex)
+			m.unreserveSlot(pb, nil, slotIndex)
 			goto retry
 		}
 	}
@@ -187,17 +180,17 @@ retryWithSlot:
 }
 
 func (m *Map[K, V]) publishClaim(pb *PrimaryBucket[K, V], oldH Header, i int) bool {
-	newH := oldH.setSlotStateAndVersion(i, SlotShadow)
+	// The caller owns Trying (01); flipping both bits publishes Shadow (10).
+	newH := oldH ^ (Header(SlotTrying^SlotShadow) << (uint(i*2) & 63))
+	newH += 1 << versionShift
 	return atomicCASHeader(&pb.Header, oldH, newH)
 }
 
-// waitForClaim spins briefly, then yields if the claim is still pending.
-func (m *Map[K, V]) waitForClaim(idx *index[K, V], pb *PrimaryBucket[K, V], hash uint64) {
+// waitForClaim spins briefly, then yields if the observed slot is still Shadow.
+func (m *Map[K, V]) waitForClaim(pb *PrimaryBucket[K, V], i int) {
 	cpu.Yield()
-	if h := atomicLoadHeader(&pb.Header); h.shadowMaskAll() != 0 {
-		if si, _ := m.findShadowSlot(idx, pb, h, hash); si >= 0 {
-			runtime.Gosched()
-		}
+	if atomicLoadHeader(&pb.Header).getSlotState(i) == SlotShadow {
+		runtime.Gosched()
 	}
 }
 
@@ -206,35 +199,36 @@ func (m *Map[K, V]) computeAndResolve(idx *index[K, V], pb *PrimaryBucket[K, V],
 	value, save := fn()
 
 	var entry *Entry[K, V]
-	target := uint8(SlotInvalid)
+	// The owned Shadow slot changes by +1 on commit or -2 on abort.
+	stateDelta := int64(SlotInvalid - SlotShadow)
 	if save {
 		entry = &Entry[K, V]{Key: key, Value: value}
 		// Publish the entry before making the slot Valid, as in Insert.
 		atomicStoreSlotVal(slot, entry)
-		target = SlotValid
+		stateDelta = SlotValid - SlotShadow
 	}
 
+	relocated := false
+	delta := Header((stateDelta << (uint(slotIndex*2) & 63)) + 1<<versionShift)
 	for {
 		hLoop := atomicLoadHeader(&pb.Header)
 		switch hLoop.getBinState() {
 		case BinNoTransfer:
-			if slot == nil {
+			if relocated {
 				// Transfer must carry every claim before marking the bin done.
 				slotIndex, slot = m.findShadowSlot(idx, pb, hLoop, hash)
 				if slot == nil {
 					panic("dlht: LoadOrCompute claim lost during resize relocation")
 				}
+				relocated = false
+				delta = Header((stateDelta << (uint(slotIndex*2) & 63)) + 1<<versionShift)
 				if entry != nil {
 					atomicStoreSlotVal(slot, entry)
 				}
 			}
-			// Only the holder can resolve a claim in a live bin.
-			if hLoop.getSlotState(slotIndex) != SlotShadow {
-				panic("dlht: LoadOrCompute claim slot not Shadow at resolve")
-			}
 			// Resolve only against NoTransfer. Committing during transfer
 			// could lose the value; after transfer we must find the carried claim.
-			if atomicCASHeader(&pb.Header, hLoop, hLoop.setSlotStateAndVersion(slotIndex, target)) {
+			if atomicCASHeader(&pb.Header, hLoop, hLoop+delta) {
 				return value, false
 			}
 		case BinInTransfer:
@@ -246,7 +240,7 @@ func (m *Map[K, V]) computeAndResolve(idx *index[K, V], pb *PrimaryBucket[K, V],
 			// Follow one generation at a time; the next bin may also be moving.
 			idx = idx.getNextIndex()
 			pb = idx.getBin(hash)
-			slot = nil
+			relocated = true
 		}
 	}
 }

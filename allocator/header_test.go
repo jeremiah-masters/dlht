@@ -38,3 +38,17 @@ func TestHeaderInvalidMasks(t *testing.T) {
 		}
 	}
 }
+
+func TestHeaderBinStateMask(t *testing.T) {
+	for state := uint8(0); state < 4; state++ {
+		for bit := range 32 {
+			version := Header(1) << (versionShift + bit)
+			for _, slots := range []Header{0, 1<<binStateShift - 1} {
+				h := version | Header(state)<<binStateShift | slots
+				if got := h.getBinState(); got != state {
+					t.Fatalf("getBinState(%#x): got %d, want %d", h, got, state)
+				}
+			}
+		}
+	}
+}

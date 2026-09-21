@@ -1,6 +1,7 @@
 package allocator
 
 import (
+	"fmt"
 	"hash/maphash"
 	"runtime"
 	"sync"
@@ -342,20 +343,24 @@ func TestLoadOrCompute_ShadowWithEntryInvisibleMidCommit(t *testing.T) {
 	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
 	const k = uint64(7)
 	hash := maphash.Comparable(testSeed, k)
-	m.Insert(1000, 1) // unrelated entry in another bin so Range yields something
+	m.Insert(1000, 1) // unrelated entry so Range yields something
 
 	idx := m.getActiveIndex()
 	pb := idx.getBin(hash)
 
 	// Publish a claim and store its entry without committing.
+	slotIndex := m.chooseInsertSlot(idx, pb)
+	if slotIndex < 0 {
+		t.Fatal("no free slot for claim")
+	}
 	h0 := atomicLoadHeader(&pb.Header)
-	h1 := h0.setSlotStateAndVersion(0, SlotTrying)
+	h1 := h0.setSlotStateAndVersion(slotIndex, SlotTrying)
 	if !atomicCASHeader(&pb.Header, h0, h1) {
 		t.Fatal("reserve CAS failed on a quiescent bin")
 	}
-	slot := idx.getSlotByIndex(pb, 0)
+	slot := idx.getSlotByIndex(pb, slotIndex)
 	slot.Key = hash
-	h2 := h1.setSlotStateAndVersion(0, SlotShadow)
+	h2 := h1.setSlotStateAndVersion(slotIndex, SlotShadow)
 	if !atomicCASHeader(&pb.Header, h1, h2) {
 		t.Fatal("publish CAS failed on a quiescent bin")
 	}
@@ -384,7 +389,7 @@ func TestLoadOrCompute_ShadowWithEntryInvisibleMidCommit(t *testing.T) {
 	})
 
 	// Commit the entry and check that it is visible.
-	if !atomicCASHeader(&pb.Header, h2, h2.setSlotStateAndVersion(0, SlotValid)) {
+	if !atomicCASHeader(&pb.Header, h2, h2.setSlotStateAndVersion(slotIndex, SlotValid)) {
 		t.Fatal("commit CAS failed on a quiescent bin")
 	}
 	if got, ok := m.Get(k); !ok || got != 42 {
@@ -1236,5 +1241,141 @@ func TestLoadOrCompute_ParkedInsertFollowsRelocatedCommit(t *testing.T) {
 	}
 	if got, ok := m.Get(8); !ok || got != 100 {
 		t.Fatalf("Get: got (%d, %v), want (100, true)", got, ok)
+	}
+}
+
+func TestClaimHeaderTransitions(t *testing.T) {
+	m := newWithSeed[uint64, uint64](Options{InitialSize: 32}, testSeed)
+	idx := m.getActiveIndex()
+	keys := keysForBin(testSeed, idx.mask, 0, MAX_SLOTS_PER_BIN, 1<<22)
+	if keys == nil {
+		t.Fatal("could not synthesize colliding keys")
+	}
+	pb := idx.getBinByIndex(0)
+	if idx.attachSingle(pb) == NO_LINK || idx.attachPair(pb) == NO_LINK {
+		t.Fatal("could not attach all link buckets")
+	}
+
+	for i := range MAX_SLOTS_PER_BIN {
+		for pattern := range 4 {
+			// Construct expected fields independently of the transition helpers.
+			headerFor := func(version uint32, state uint8) Header {
+				h := Header(version) << versionShift
+				for j := range MAX_SLOTS_PER_BIN {
+					s := uint8((j + pattern) % 4)
+					if j == i {
+						s = state
+					}
+					h |= Header(s) << (2 * j)
+				}
+				return h
+			}
+			for _, version := range []uint32{0, 1, 0x80000000, 0xfffffffe, 0xffffffff} {
+				for _, save := range []bool{false, true} {
+					var entries [MAX_SLOTS_PER_BIN]*Entry[uint64, uint64]
+					for j := range MAX_SLOTS_PER_BIN {
+						slot := idx.getSlotByIndex(pb, j)
+						slot.Key = maphash.Comparable(testSeed, keys[j])
+						if j != i && (j+pattern)%4 == SlotValid {
+							entries[j] = &Entry[uint64, uint64]{Key: keys[j], Value: uint64(j)}
+						}
+						slot.Val = entries[j]
+					}
+					slot := idx.getSlotByIndex(pb, i)
+					before := headerFor(version, SlotTrying)
+					pb.Header = before
+					if !m.publishClaim(pb, before, i) {
+						t.Fatalf("slot %d: publish failed", i)
+					}
+					if want := headerFor(version+1, SlotShadow); pb.Header != want {
+						t.Fatalf("publish slot %d, pattern %d, version %#x: got %#x, want %#x", i, pattern, version, pb.Header, want)
+					}
+
+					calls := 0
+					value, loaded := m.computeAndResolve(idx, pb, slot, i, slot.Key, keys[i], func() (uint64, bool) {
+						calls++
+						return 77, save
+					})
+					if calls != 1 || value != 77 || loaded {
+						t.Fatalf("slot %d, save %t: calls=%d, value=%d, loaded=%t", i, save, calls, value, loaded)
+					}
+					state := uint8(SlotInvalid)
+					if save {
+						state = SlotValid
+					}
+					if want := headerFor(version+2, state); pb.Header != want {
+						t.Fatalf("resolve slot %d, pattern %d, version %#x, save %t: got %#x, want %#x", i, pattern, version, save, pb.Header, want)
+					}
+					if save {
+						if entry := atomicLoadSlotVal(slot); entry == nil || entry.Key != keys[i] || entry.Value != 77 {
+							t.Fatalf("slot %d: committed entry = %+v", i, entry)
+						}
+					} else if atomicLoadSlotVal(slot) != nil {
+						t.Fatalf("slot %d: abort stored an entry", i)
+					}
+					for j := range MAX_SLOTS_PER_BIN {
+						if j != i && atomicLoadSlotVal(idx.getSlotByIndex(pb, j)) != entries[j] {
+							t.Fatalf("resolve slot %d changed slot %d's entry", i, j)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestUnreserveSlot(t *testing.T) {
+	for i := range MAX_SLOTS_PER_BIN {
+		for _, clearEntry := range []bool{false, true} {
+			for binState := uint8(BinNoTransfer); binState <= BinDoneTransfer; binState++ {
+				t.Run(fmt.Sprintf("slot_%d/entry_%t/bin_%d", i, clearEntry, binState), func(t *testing.T) {
+					m, idx, pb := reservationTestBin(t, 3)
+					var h Header
+					for j := range MAX_SLOTS_PER_BIN {
+						h = h.setSlotStateAndVersion(j, SlotValid)
+					}
+					h = h.setSlotStateAndVersion(i, SlotTrying).setBinState(binState)
+					pb.Header = h
+					slot := idx.getSlotByIndex(pb, i)
+					slot.Key = 42
+					var clear *Slot[uint64, uint64]
+					if clearEntry {
+						slot.Val = &Entry[uint64, uint64]{Key: 42, Value: 7}
+						clear = slot
+					}
+					entry := slot.Val
+
+					m.unreserveSlot(pb, clear, i)
+
+					if slot.Key != 42 {
+						t.Fatal("unreserve changed the hash")
+					}
+					if binState != BinNoTransfer {
+						if pb.Header != h || slot.Val != entry {
+							t.Fatal("unreserve changed a transferring bin")
+						}
+						return
+					}
+					if slot.Val != nil {
+						t.Fatal("released slot retains an entry")
+					}
+					for j := range MAX_SLOTS_PER_BIN {
+						want := uint8(SlotValid)
+						if j == i {
+							want = SlotInvalid
+						}
+						if got := pb.Header.getSlotState(j); got != want {
+							t.Fatalf("slot %d state: got %d, want %d", j, got, want)
+						}
+					}
+					if got, want := uint64(pb.Header)>>versionShift, (uint64(h)>>versionShift)+1; got != want {
+						t.Fatalf("version: got %d, want %d", got, want)
+					}
+					if pb.Header.getBinState() != BinNoTransfer {
+						t.Fatal("unreserve changed the bin state")
+					}
+				})
+			}
+		}
 	}
 }
