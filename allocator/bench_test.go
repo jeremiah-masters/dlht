@@ -86,3 +86,32 @@ func BenchmarkPutExisting(b *testing.B) {
 		}
 	}
 }
+
+// Compare the existing-key path with BenchmarkGetHit.
+func BenchmarkLoadOrComputeHit(b *testing.B) {
+	keys := benchKeys()
+	m := prefilledMap(keys)
+	fn := func() (uint64, bool) { b.Fatal("fn ran on hit path"); return 0, false }
+	b.ResetTimer()
+	for i := 0; b.Loop(); i++ {
+		if _, loaded := m.LoadOrCompute(keys[i&(benchKeyspace-1)], fn); !loaded {
+			b.Fatal("miss")
+		}
+	}
+}
+
+// A successful compute reserves, publishes, and commits before deletion.
+func BenchmarkLoadOrComputeCompute(b *testing.B) {
+	keys := benchKeys()
+	m := prefilledMap(keys)
+	b.ResetTimer()
+	for i := 0; b.Loop(); i++ {
+		k := uint64(i) | 1<<62 | 1<<63
+		if _, loaded := m.LoadOrCompute(k, func() (uint64, bool) { return k, true }); loaded {
+			b.Fatal("unexpected hit")
+		}
+		if _, ok := m.Delete(k); !ok {
+			b.Fatal("delete failed")
+		}
+	}
+}

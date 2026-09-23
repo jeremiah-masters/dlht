@@ -52,3 +52,63 @@ func TestHeaderBinStateMask(t *testing.T) {
 		}
 	}
 }
+
+// Valid (0b11) and Shadow (0b10) share their high bit: every mask must match
+// exactly, and the bin-state bits must never leak into the slot masks.
+func TestHeaderMasks_ShadowExactness(t *testing.T) {
+	var h Header
+	h = h.setSlotStateAndVersion(0, SlotValid)
+	h = h.setSlotStateAndVersion(1, SlotShadow)
+	h = h.setSlotStateAndVersion(2, SlotTrying)
+	h = h.setSlotStateAndVersion(3, SlotShadow)  // link slot (single, first)
+	h = h.setSlotStateAndVersion(7, SlotValid)   // link slot (pair0, first)
+	h = h.setSlotStateAndVersion(14, SlotShadow) // last slot
+	h = h.setBinState(BinInTransfer)             // must not contaminate any mask
+
+	if got := h.getSlotState(1); got != SlotShadow {
+		t.Errorf("getSlotState(1): got %d, want SlotShadow", got)
+	}
+	if got, want := h.validMask3(), uint32(0x01); got != want {
+		t.Errorf("validMask3: got %#x, want %#x (Shadow must not read as Valid)", got, want)
+	}
+	if got, want := h.shadowMask3(), uint32(0x04); got != want {
+		t.Errorf("shadowMask3: got %#x, want %#x", got, want)
+	}
+	if got, want := h.invalidMask3(), uint32(0x00); got != want {
+		t.Errorf("invalidMask3: got %#x, want %#x", got, want)
+	}
+	if got, want := h.validMask4(PRIMARY_SLOTS), uint32(0x00); got != want {
+		t.Errorf("validMask4(3): got %#x, want %#x", got, want)
+	}
+	if got, want := h.shadowMask4(PRIMARY_SLOTS), uint32(0x01); got != want {
+		t.Errorf("shadowMask4(3): got %#x, want %#x", got, want)
+	}
+	if got, want := h.validMask4(PRIMARY_SLOTS+LINK_SLOTS), uint32(0x01); got != want {
+		t.Errorf("validMask4(7): got %#x, want %#x", got, want)
+	}
+	// Spread positions for slots 1, 3, 14: bits 2, 6, 28.
+	if got, want := h.shadowMaskAll(), uint32(1<<2|1<<6|1<<28); got != want {
+		t.Errorf("shadowMaskAll: got %#x, want %#x", got, want)
+	}
+
+	// A Valid slot 14 next to Done bin-state bits: neither mask may see
+	// phantom bits from the header's [31:30] region.
+	var h2 Header
+	h2 = h2.setSlotStateAndVersion(14, SlotValid)
+	h2 = h2.setBinState(BinDoneTransfer)
+	if got, want := h2.shadowMaskAll(), uint32(0); got != want {
+		t.Errorf("shadowMaskAll with Valid slot 14 + Done: got %#x, want %#x", got, want)
+	}
+	if got, want := h2.validMask4(PRIMARY_SLOTS+2*LINK_SLOTS), uint32(0x40); got != want {
+		t.Errorf("validMask4(11) for slot 14: got %#x, want %#x", got, want)
+	}
+	var h3 Header
+	h3 = h3.setSlotStateAndVersion(14, SlotShadow)
+	h3 = h3.setBinState(BinInTransfer)
+	if got, want := h3.shadowMaskAll(), uint32(1<<28); got != want {
+		t.Errorf("shadowMaskAll slot14 Shadow + InTransfer: got %#x, want %#x", got, want)
+	}
+	if got, want := h3.validMask4(PRIMARY_SLOTS+2*LINK_SLOTS), uint32(0x00); got != want {
+		t.Errorf("validMask4(11) slot14 Shadow: got %#x, want %#x", got, want)
+	}
+}

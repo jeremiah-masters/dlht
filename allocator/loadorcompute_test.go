@@ -3,6 +3,7 @@ package allocator
 import (
 	"fmt"
 	"hash/maphash"
+	"math/rand/v2"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -445,6 +446,98 @@ func TestLoadOrCompute_FnOnceUnderContention(t *testing.T) {
 	}
 }
 
+// Aborted computes can have linearizable results even if their callbacks overlap.
+func TestLoadOrCompute_FnNeverOverlaps(t *testing.T) {
+	const (
+		goroutines = 8
+		numKeys    = 8
+		operations = 1000
+	)
+	for _, procs := range []int{1, 2, 8} {
+		t.Run(fmt.Sprintf("procs_%d", procs), func(t *testing.T) {
+			prev := runtime.GOMAXPROCS(procs)
+			defer runtime.GOMAXPROCS(prev)
+			m := New[uint64, uint64](Options{InitialSize: 1})
+			oldIdx := m.getActiveIndex()
+
+			var active [numKeys]atomic.Int32
+			var overlaps [numKeys]atomic.Int32
+			var fnRuns [2]atomic.Int32 // abort, save
+			var started sync.Once
+			computing := make(chan struct{})
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			for g := range goroutines {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					rng := rand.New(rand.NewPCG(uint64(g+1), 1))
+					<-start
+					for i := range operations {
+						key := uint64(rng.IntN(numKeys))
+						value := uint64(g*operations + i + 1)
+						switch rng.IntN(8) {
+						case 0, 1, 2, 3:
+							outcome := rng.IntN(2)
+							m.LoadOrCompute(key, func() (uint64, bool) {
+								if active[key].Add(1) != 1 {
+									overlaps[key].Add(1)
+								}
+								defer active[key].Add(-1)
+								fnRuns[outcome].Add(1)
+								started.Do(func() { close(computing) })
+								runtime.Gosched()
+								return value, outcome == 1
+							})
+						case 4:
+							m.Insert(key, value)
+						case 5:
+							m.Put(key, value)
+						case 6, 7:
+							m.Delete(key)
+						}
+					}
+				}()
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-computing
+				for i := range 512 {
+					m.Insert(uint64(numKeys+i), uint64(i))
+					runtime.Gosched()
+				}
+			}()
+			close(start)
+			done := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("workers did not finish")
+			}
+
+			for key := range numKeys {
+				if n := overlaps[key].Load(); n != 0 {
+					t.Errorf("key %d: %d overlapping callbacks", key, n)
+				}
+				if n := active[key].Load(); n != 0 {
+					t.Errorf("key %d: %d callbacks still active", key, n)
+				}
+			}
+			if fnRuns[0].Load() == 0 || fnRuns[1].Load() == 0 {
+				t.Fatalf("callback counts: abort=%d, save=%d; want both outcomes", fnRuns[0].Load(), fnRuns[1].Load())
+			}
+			if m.getActiveIndex() == oldIdx {
+				t.Fatal("workload did not trigger resize")
+			}
+		})
+	}
+}
+
 // An Insert racing a pending claim must wait and lose to the commit.
 func TestLoadOrCompute_InsertBacksOffDuringClaim(t *testing.T) {
 	m := New[uint64, uint64](Options{InitialSize: 16})
@@ -624,6 +717,140 @@ func TestLoadOrCompute_WaiterComputesAfterAbort(t *testing.T) {
 	}
 	if got, ok := m.Get(6); !ok || got != 43 {
 		t.Fatalf("Get: got (%d, %v), want (43, true)", got, ok)
+	}
+}
+
+// A holder must wait out InTransfer even after storing its computed entry.
+func TestLoadOrCompute_ResolveDuringTransfer(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		save bool
+	}{
+		{"commit", true},
+		{"abort", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
+			const key = uint64(42)
+			hash := maphash.Comparable(testSeed, key)
+			oldIdx := m.getActiveIndex()
+			oldPb := oldIdx.getBin(hash)
+
+			started := make(chan struct{})
+			release := make(chan struct{})
+			returning := make(chan struct{})
+			done := make(chan struct{})
+			var v uint64
+			var loaded bool
+			go func() {
+				defer close(done)
+				v, loaded = m.LoadOrCompute(key, func() (uint64, bool) {
+					close(started)
+					<-release
+					close(returning)
+					return 777, tc.save
+				})
+			}()
+			defer func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					t.Error("holder did not finish")
+				}
+			}()
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("callback did not start")
+			}
+
+			h := atomicLoadHeader(&oldPb.Header)
+			si, slot := m.findShadowSlot(oldIdx, oldPb, h, hash)
+			if slot == nil {
+				t.Fatal("claim not present while fn runs")
+			}
+			newIdx := newIndex[uint64, uint64](128)
+			ctx := &resizeContext[uint64, uint64]{
+				oldIndex:       oldIdx,
+				newIndex:       newIdx,
+				linkNextResize: uint32(len(newIdx.links)),
+			}
+			oldIdx.indexNext.Store(newIdx)
+			atomic.OrUint64((*uint64)(&oldPb.Header), uint64(BinInTransfer)<<binStateShift)
+			close(release)
+			select {
+			case <-returning:
+			case <-time.After(5 * time.Second):
+				t.Error("callback did not return")
+			}
+			if tc.save {
+				deadline := time.Now().Add(5 * time.Second)
+				for atomicLoadSlotVal(slot) == nil {
+					if time.Now().After(deadline) {
+						t.Error("holder did not store its computed entry")
+						break
+					}
+					runtime.Gosched()
+				}
+			}
+			select {
+			case <-done:
+				t.Error("holder resolved while the bin was InTransfer")
+			case <-time.After(50 * time.Millisecond):
+			}
+			if got := atomicLoadHeader(&oldPb.Header); got.getBinState() != BinInTransfer || got.getSlotState(si) != SlotShadow {
+				t.Errorf("holder changed the transferring header: got %#x", got)
+			}
+
+			// Carry only the hash, even if the old Shadow now holds an entry.
+			m.carryShadowSlots(ctx, h.shadowMask3(), oldPb.slotAt(0))
+			newPb := newIdx.getBin(hash)
+			newSi, newSlot := m.findShadowSlot(newIdx, newPb, atomicLoadHeader(&newPb.Header), hash)
+			if newSlot == nil || atomicLoadSlotVal(newSlot) != nil {
+				t.Error("carried claim must have a nil entry")
+			}
+			// Complete the transfer before stopping on any failed assertions.
+			atomic.StoreUint64((*uint64)(&oldPb.Header), uint64(h.setBinState(BinDoneTransfer)))
+			m.active.Store(newIdx)
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("holder still blocked after transfer")
+			}
+			if t.Failed() {
+				return
+			}
+
+			if loaded || v != 777 {
+				t.Fatalf("got (%d, %v), want (777, false)", v, loaded)
+			}
+			if got, ok := m.Get(key); ok != tc.save || (ok && got != 777) {
+				t.Fatalf("Get after transfer: got (%d, %v), save=%v", got, ok, tc.save)
+			}
+			wantState := uint8(SlotInvalid)
+			if tc.save {
+				wantState = SlotValid
+			}
+			if got := atomicLoadHeader(&newPb.Header).getSlotState(newSi); got != wantState {
+				t.Fatalf("resolved slot state: got %d, want %d", got, wantState)
+			}
+			if tc.save {
+				if got, ok := m.Delete(key); !ok || got != 777 {
+					t.Fatalf("Delete: got (%d, %v), want (777, true)", got, ok)
+				}
+			}
+			if atomicLoadSlotVal(newSlot) != nil {
+				t.Fatal("released slot retains an entry")
+			}
+			if got, loaded := m.LoadOrCompute(key, func() (uint64, bool) { return 5, true }); loaded || got != 5 {
+				t.Fatalf("recompute: got (%d, %v), want (5, false)", got, loaded)
+			}
+		})
 	}
 }
 
@@ -949,95 +1176,6 @@ func TestLoadOrCompute_StressWithResizes(t *testing.T) {
 	}
 	if s := m.Size(); s != numKeys {
 		t.Errorf("Size: got %d, want %d", s, numKeys)
-	}
-}
-
-// Compare the existing-key path with BenchmarkGetHit.
-func BenchmarkLoadOrComputeHit(b *testing.B) {
-	keys := benchKeys()
-	m := prefilledMap(keys)
-	fn := func() (uint64, bool) { b.Fatal("fn ran on hit path"); return 0, false }
-	b.ResetTimer()
-	for i := 0; b.Loop(); i++ {
-		if _, loaded := m.LoadOrCompute(keys[i&(benchKeyspace-1)], fn); !loaded {
-			b.Fatal("miss")
-		}
-	}
-}
-
-// A successful compute reserves, publishes, and commits before deletion.
-func BenchmarkLoadOrComputeCompute(b *testing.B) {
-	keys := benchKeys()
-	m := prefilledMap(keys)
-	b.ResetTimer()
-	for i := 0; b.Loop(); i++ {
-		k := uint64(i) | 1<<62 | 1<<63
-		if _, loaded := m.LoadOrCompute(k, func() (uint64, bool) { return k, true }); loaded {
-			b.Fatal("unexpected hit")
-		}
-		if _, ok := m.Delete(k); !ok {
-			b.Fatal("delete failed")
-		}
-	}
-}
-
-// Valid (0b11) and Shadow (0b10) share their high bit: every mask must match
-// exactly, and the bin-state bits must never leak into the slot masks.
-func TestHeaderMasks_ShadowExactness(t *testing.T) {
-	var h Header
-	h = h.setSlotStateAndVersion(0, SlotValid)
-	h = h.setSlotStateAndVersion(1, SlotShadow)
-	h = h.setSlotStateAndVersion(2, SlotTrying)
-	h = h.setSlotStateAndVersion(3, SlotShadow)  // link slot (single, first)
-	h = h.setSlotStateAndVersion(7, SlotValid)   // link slot (pair0, first)
-	h = h.setSlotStateAndVersion(14, SlotShadow) // last slot
-	h = h.setBinState(BinInTransfer)             // must not contaminate any mask
-
-	if got := h.getSlotState(1); got != SlotShadow {
-		t.Errorf("getSlotState(1): got %d, want SlotShadow", got)
-	}
-	if got, want := h.validMask3(), uint32(0x01); got != want {
-		t.Errorf("validMask3: got %#x, want %#x (Shadow must not read as Valid)", got, want)
-	}
-	if got, want := h.shadowMask3(), uint32(0x04); got != want {
-		t.Errorf("shadowMask3: got %#x, want %#x", got, want)
-	}
-	if got, want := h.invalidMask3(), uint32(0x00); got != want {
-		t.Errorf("invalidMask3: got %#x, want %#x", got, want)
-	}
-	if got, want := h.validMask4(PRIMARY_SLOTS), uint32(0x00); got != want {
-		t.Errorf("validMask4(3): got %#x, want %#x", got, want)
-	}
-	if got, want := h.shadowMask4(PRIMARY_SLOTS), uint32(0x01); got != want {
-		t.Errorf("shadowMask4(3): got %#x, want %#x", got, want)
-	}
-	if got, want := h.validMask4(PRIMARY_SLOTS+LINK_SLOTS), uint32(0x01); got != want {
-		t.Errorf("validMask4(7): got %#x, want %#x", got, want)
-	}
-	// Spread positions for slots 1, 3, 14: bits 2, 6, 28.
-	if got, want := h.shadowMaskAll(), uint32(1<<2|1<<6|1<<28); got != want {
-		t.Errorf("shadowMaskAll: got %#x, want %#x", got, want)
-	}
-
-	// A Valid slot 14 next to Done bin-state bits: neither mask may see
-	// phantom bits from the header's [31:30] region.
-	var h2 Header
-	h2 = h2.setSlotStateAndVersion(14, SlotValid)
-	h2 = h2.setBinState(BinDoneTransfer)
-	if got, want := h2.shadowMaskAll(), uint32(0); got != want {
-		t.Errorf("shadowMaskAll with Valid slot 14 + Done: got %#x, want %#x", got, want)
-	}
-	if got, want := h2.validMask4(PRIMARY_SLOTS+2*LINK_SLOTS), uint32(0x40); got != want {
-		t.Errorf("validMask4(11) for slot 14: got %#x, want %#x", got, want)
-	}
-	var h3 Header
-	h3 = h3.setSlotStateAndVersion(14, SlotShadow)
-	h3 = h3.setBinState(BinInTransfer)
-	if got, want := h3.shadowMaskAll(), uint32(1<<28); got != want {
-		t.Errorf("shadowMaskAll slot14 Shadow + InTransfer: got %#x, want %#x", got, want)
-	}
-	if got, want := h3.validMask4(PRIMARY_SLOTS+2*LINK_SLOTS), uint32(0x00); got != want {
-		t.Errorf("validMask4(11) slot14 Shadow: got %#x, want %#x", got, want)
 	}
 }
 
