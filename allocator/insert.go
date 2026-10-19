@@ -87,7 +87,7 @@ retry:
 		goto retry
 	}
 
-	// Step 4: Reserve the slot (transition Invalid to TryInsert)
+	// Step 4: Reserve the slot (transition Invalid to Trying)
 	h1 := h0.setSlotStateAndVersion(slotIndex, SlotTrying)
 	if !m.reserveSlot(pb, h0, h1) {
 		goto retry
@@ -99,7 +99,7 @@ retry:
 	entry := &Entry[K, V]{Key: key, Value: value}
 	atomicStoreSlotVal(slot, entry) // We must release-store the entry to synchronize with any concurrent reads
 
-	// Step 5: Transition slot TryInsert to Valid
+	// Step 5: Transition slot Trying to Valid
 	if m.finalizeSlot(pb, h1, slotIndex) {
 		var zero V
 		return zero, true

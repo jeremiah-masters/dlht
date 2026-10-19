@@ -104,7 +104,7 @@ retry:
 		goto retry
 	}
 
-	// Step 4: Reserve the slot (transition Invalid to TryInsert)
+	// Step 4: Reserve the slot (transition Invalid to Trying)
 	h1 := h0.setSlotStateAndVersion(slotIndex, SlotTrying)
 	if !m.reserveSlot(pb, h0, h1) {
 		goto retry
@@ -114,7 +114,7 @@ retry:
 	slot := idx.getSlotByIndex(pb, slotIndex)
 	slot.Key = hash
 
-	// Publish the claim before calling fn.
+	// Step 5: Publish the claim (Trying to Shadow) before calling fn.
 	if m.publishClaim(pb, h1, slotIndex) {
 		return m.computeAndResolve(idx, pb, slot, slotIndex, hash, key, fn)
 	}
@@ -180,9 +180,7 @@ retryWithSlot:
 }
 
 func (m *Map[K, V]) publishClaim(pb *PrimaryBucket[K, V], oldH Header, i int) bool {
-	// The caller owns Trying (01); flipping both bits publishes Shadow (10).
-	newH := oldH ^ (Header(SlotTrying^SlotShadow) << (uint(i*2) & 63))
-	newH += 1 << versionShift
+	newH := oldH.setSlotStateAndVersion(i, SlotShadow)
 	return atomicCASHeader(&pb.Header, oldH, newH)
 }
 
