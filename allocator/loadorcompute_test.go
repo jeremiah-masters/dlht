@@ -1013,48 +1013,111 @@ func TestLoadOrCompute_DoubleRelocation(t *testing.T) {
 	}
 }
 
-// A claim sitting in a link slot is carried like any other.
+// Keep the cohort together after resize so claims exercise the child links too.
 func TestLoadOrCompute_LinkClaimCarriedAcrossResize(t *testing.T) {
-	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
-	keys := keysForBin(testSeed, 15, 0, 4, 1<<22)
+	keys := keysForBin(testSeed, 255, 0, MAX_SLOTS_PER_BIN, 1<<22)
 	if keys == nil {
-		t.Skip("could not synthesize colliding keys")
+		t.Fatal("could not synthesize colliding keys")
 	}
-	for i := range 3 {
-		m.Insert(keys[i], uint64(i))
-	}
+	for _, slotIndex := range []int{PRIMARY_SLOTS, PRIMARY_SLOTS + LINK_SLOTS, PRIMARY_SLOTS + 2*LINK_SLOTS, MAX_SLOTS_PER_BIN - 1} {
+		for _, save := range []bool{true, false} {
+			t.Run(fmt.Sprintf("slot_%d/save_%t", slotIndex, save), func(t *testing.T) {
+				m := newWithSeed[uint64, uint64](Options{InitialSize: 32}, testSeed)
+				oldIdx := m.getActiveIndex()
+				for i := range slotIndex {
+					if _, ok := m.Insert(keys[i], uint64(i)); !ok {
+						t.Fatalf("Insert(keys[%d]) failed", i)
+					}
+				}
+				key := keys[slotIndex]
+				hash := maphash.Comparable(testSeed, key)
+				oldPb := oldIdx.getBin(hash)
 
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var v uint64
-	var loaded bool
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		v, loaded = m.LoadOrCompute(keys[3], func() (uint64, bool) {
-			close(started)
-			<-release
-			return 99, true
-		})
-	}()
-	<-started
+				started := make(chan struct{})
+				release := make(chan struct{})
+				done := make(chan struct{})
+				var v uint64
+				var loaded bool
+				go func() {
+					defer close(done)
+					v, loaded = m.LoadOrCompute(key, func() (uint64, bool) {
+						close(started)
+						<-release
+						return 99, save
+					})
+				}()
+				defer func() {
+					select {
+					case <-release:
+					default:
+						close(release)
+					}
+				}()
+				select {
+				case <-started:
+				case <-time.After(5 * time.Second):
+					t.Fatal("callback did not start")
+				}
+				if m.getActiveIndex() != oldIdx {
+					t.Fatal("map resized before the claim was placed")
+				}
+				if si, _ := m.findShadowSlot(oldIdx, oldPb, atomicLoadHeader(&oldPb.Header), hash); si != slotIndex {
+					t.Fatalf("old claim slot: got %d, want %d", si, slotIndex)
+				}
 
-	if !m.triggerResize() {
-		t.Fatal("triggerResize refused")
-	}
-	close(release)
-	<-done
+				if !m.triggerResize() {
+					t.Fatal("triggerResize refused")
+				}
+				newIdx := m.getActiveIndex()
+				if newIdx == oldIdx {
+					t.Fatal("resize did not swap the active index")
+				}
+				newPb := newIdx.getBin(hash)
+				si, slot := m.findShadowSlot(newIdx, newPb, atomicLoadHeader(&newPb.Header), hash)
+				if si != slotIndex {
+					t.Fatalf("carried claim slot: got %d, want %d", si, slotIndex)
+				}
+				if atomicLoadSlotVal(slot) != nil {
+					t.Fatal("carried claim has an entry before fn returns")
+				}
+				if _, ok := m.Get(key); ok {
+					t.Fatal("carried claim is visible before fn returns")
+				}
 
-	if loaded || v != 99 {
-		t.Fatalf("got (%d, %v), want (99, false)", v, loaded)
-	}
-	for i := range 3 {
-		if got, ok := m.Get(keys[i]); !ok || got != uint64(i) {
-			t.Fatalf("Get(keys[%d]): got (%d, %v), want (%d, true)", i, got, ok, i)
+				close(release)
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					t.Fatal("holder did not finish after resize")
+				}
+				if loaded || v != 99 {
+					t.Fatalf("got (%d, %v), want (99, false)", v, loaded)
+				}
+				if got, ok := m.Get(key); ok != save || (ok && got != 99) {
+					t.Fatalf("Get after resize: got (%d, %v), save=%t", got, ok, save)
+				}
+				wantState := uint8(SlotInvalid)
+				if save {
+					wantState = SlotValid
+				}
+				if got := atomicLoadHeader(&newPb.Header).getSlotState(si); got != wantState {
+					t.Fatalf("resolved slot state: got %d, want %d", got, wantState)
+				}
+				if !save {
+					if atomicLoadSlotVal(slot) != nil {
+						t.Fatal("aborted claim retains an entry")
+					}
+					if _, ok := m.Insert(key, 100); !ok {
+						t.Fatal("Insert failed after abort")
+					}
+				}
+				for i := range slotIndex {
+					if got, ok := m.Get(keys[i]); !ok || got != uint64(i) {
+						t.Fatalf("Get(keys[%d]): got (%d, %v), want (%d, true)", i, got, ok, i)
+					}
+				}
+			})
 		}
-	}
-	if got, ok := m.Get(keys[3]); !ok || got != 99 {
-		t.Fatalf("Get(keys[3]): got (%d, %v), want (99, true)", got, ok)
 	}
 }
 
