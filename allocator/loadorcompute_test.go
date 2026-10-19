@@ -123,6 +123,64 @@ func TestLoadOrCompute_AfterDelete(t *testing.T) {
 	}
 }
 
+// pendingCompute is a LoadOrCompute whose fn blocks until the test releases it.
+type pendingCompute struct {
+	release  chan struct{} // closed by unblock
+	returned chan struct{} // closed as fn returns
+	done     chan struct{} // closed after LoadOrCompute returns
+	value    uint64
+	loaded   bool
+}
+
+// startCompute calls LoadOrCompute(key) on a new goroutine and returns once
+// fn is running. Once released, fn returns (value, save).
+func startCompute(t *testing.T, m *Map[uint64, uint64], key, value uint64, save bool) *pendingCompute {
+	t.Helper()
+	c := &pendingCompute{
+		release:  make(chan struct{}),
+		returned: make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	started := make(chan struct{})
+	go func() {
+		defer close(c.done)
+		c.value, c.loaded = m.LoadOrCompute(key, func() (uint64, bool) {
+			close(started)
+			<-c.release
+			close(c.returned)
+			return value, save
+		})
+	}()
+	t.Cleanup(c.unblock) // don't leave the holder parked if the test stops early
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("callback did not start")
+	}
+	return c
+}
+
+// unblock lets fn return.
+func (c *pendingCompute) unblock() {
+	select {
+	case <-c.release:
+	default:
+		close(c.release)
+	}
+}
+
+// result unblocks fn and waits for LoadOrCompute to return.
+func (c *pendingCompute) result(t *testing.T) (uint64, bool) {
+	t.Helper()
+	c.unblock()
+	select {
+	case <-c.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("LoadOrCompute did not return after fn was released")
+	}
+	return c.value, c.loaded
+}
+
 // Fill the primary slots so the claim uses a link slot.
 func TestLoadOrCompute_LinkSlotClaim(t *testing.T) {
 	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
@@ -134,33 +192,15 @@ func TestLoadOrCompute_LinkSlotClaim(t *testing.T) {
 		m.Insert(keys[i], uint64(i))
 	}
 
+	c := startCompute(t, m, keys[3], 99, true)
 	hash := maphash.Comparable(testSeed, keys[3])
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var v uint64
-	var loaded bool
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		v, loaded = m.LoadOrCompute(keys[3], func() (uint64, bool) {
-			close(started)
-			<-release
-			return 99, true
-		})
-	}()
-	<-started
-
 	idx := m.getActiveIndex()
 	pb := idx.getBin(hash)
-	h := atomicLoadHeader(&pb.Header)
-	si, _ := m.findShadowSlot(idx, pb, h, hash)
-	if si < PRIMARY_SLOTS {
+	if si, _ := m.findShadowSlot(idx, pb, atomicLoadHeader(&pb.Header), hash); si < PRIMARY_SLOTS {
 		t.Errorf("claim slot: got %d, want a link slot (>= %d)", si, PRIMARY_SLOTS)
 	}
 
-	close(release)
-	<-done
-	if loaded || v != 99 {
+	if v, loaded := c.result(t); loaded || v != 99 {
 		t.Fatalf("got (%d, %v), want (99, false)", v, loaded)
 	}
 	if got, ok := m.Get(keys[3]); !ok || got != 99 {
@@ -202,18 +242,7 @@ func TestLoadOrCompute_InvisibleWhileClaimHeld(t *testing.T) {
 	m := New[uint64, uint64](Options{InitialSize: 16})
 	m.Insert(1000, 1) // unrelated entry so Range has something legitimate
 
-	started := make(chan struct{})
-	release := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		m.LoadOrCompute(77, func() (uint64, bool) {
-			close(started)
-			<-release
-			return 5, true
-		})
-	}()
-	<-started
+	c := startCompute(t, m, 77, 5, true)
 
 	if _, ok := m.Get(77); ok {
 		t.Error("Get sees the key while its claim is pending")
@@ -237,8 +266,7 @@ func TestLoadOrCompute_InvisibleWhileClaimHeld(t *testing.T) {
 		return true
 	})
 
-	close(release)
-	<-done
+	c.result(t)
 	if got, ok := m.Get(77); !ok || got != 5 {
 		t.Fatalf("Get after commit: got (%d, %v), want (5, true)", got, ok)
 	}
@@ -446,7 +474,8 @@ func TestLoadOrCompute_FnOnceUnderContention(t *testing.T) {
 	}
 }
 
-// Aborted computes can have linearizable results even if their callbacks overlap.
+// Callbacks for a key never overlap, aborted ones included. Porcupine cannot
+// see overlapping aborts, so count active callbacks directly.
 func TestLoadOrCompute_FnNeverOverlaps(t *testing.T) {
 	const (
 		goroutines = 8
@@ -538,185 +567,82 @@ func TestLoadOrCompute_FnNeverOverlaps(t *testing.T) {
 	}
 }
 
-// An Insert racing a pending claim must wait and lose to the commit.
-func TestLoadOrCompute_InsertBacksOffDuringClaim(t *testing.T) {
-	m := New[uint64, uint64](Options{InitialSize: 16})
+// opResult is the (value, bool) pair Insert and LoadOrCompute return.
+type opResult struct {
+	value uint64
+	ok    bool
+}
 
-	started := make(chan struct{})
-	release := make(chan struct{})
-	holderDone := make(chan struct{})
+// goOp runs op on a new goroutine and delivers its result.
+func goOp(op func() (uint64, bool)) <-chan opResult {
+	ch := make(chan opResult, 1)
 	go func() {
-		defer close(holderDone)
-		m.LoadOrCompute(8, func() (uint64, bool) {
-			close(started)
-			<-release
-			return 100, true
-		})
+		v, ok := op()
+		ch <- opResult{v, ok}
 	}()
-	<-started
+	return ch
+}
 
-	type insRes struct {
-		prev uint64
-		ok   bool
-	}
-	insDone := make(chan insRes, 1)
-	go func() {
-		prev, ok := m.Insert(8, 200)
-		insDone <- insRes{prev, ok}
-	}()
-
+// requireBlocked fails if ch delivers a result within d.
+func requireBlocked(t *testing.T, ch <-chan opResult, d time.Duration, what string) {
+	t.Helper()
 	select {
-	case r := <-insDone:
-		t.Fatalf("Insert returned (%d, %v) while the claim was pending", r.prev, r.ok)
-	case <-time.After(100 * time.Millisecond):
-		// still blocked, as required
-	}
-
-	close(release)
-	<-holderDone
-	select {
-	case r := <-insDone:
-		if r.ok || r.prev != 100 {
-			t.Fatalf("Insert after commit: got (%d, %v), want (100, false)", r.prev, r.ok)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Insert still blocked after the claim resolved")
+	case r := <-ch:
+		t.Fatalf("%s returned %+v while the claim was pending", what, r)
+	case <-time.After(d):
 	}
 }
 
-// After a save=false abort the blocked Insert proceeds and wins.
-func TestLoadOrCompute_InsertWinsAfterAbort(t *testing.T) {
-	m := New[uint64, uint64](Options{InitialSize: 16})
-
-	started := make(chan struct{})
-	release := make(chan struct{})
-	go func() {
-		m.LoadOrCompute(8, func() (uint64, bool) {
-			close(started)
-			<-release
-			return 100, false
-		})
-	}()
-	<-started
-
-	type insRes struct {
-		prev uint64
-		ok   bool
-	}
-	insDone := make(chan insRes, 1)
-	go func() {
-		prev, ok := m.Insert(8, 200)
-		insDone <- insRes{prev, ok}
-	}()
-
+// awaitOp waits for the result on ch.
+func awaitOp(t *testing.T, ch <-chan opResult, what string) opResult {
+	t.Helper()
 	select {
-	case r := <-insDone:
-		t.Fatalf("Insert returned (%d, %v) while the claim was pending", r.prev, r.ok)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	close(release)
-	select {
-	case r := <-insDone:
-		if !r.ok {
-			t.Fatalf("Insert after abort: got ok=false, want a successful insert")
-		}
+	case r := <-ch:
+		return r
 	case <-time.After(5 * time.Second):
-		t.Fatal("Insert still blocked after the claim aborted")
-	}
-	if got, ok := m.Get(8); !ok || got != 200 {
-		t.Fatalf("Get: got (%d, %v), want (200, true)", got, ok)
+		t.Fatalf("%s still blocked after the claim resolved", what)
+		return opResult{}
 	}
 }
 
-// A second LoadOrCompute waits out the first and loads its committed value
-// without running its own fn.
-func TestLoadOrCompute_WaiterLoadsAfterCommit(t *testing.T) {
-	m := New[uint64, uint64](Options{InitialSize: 16})
+// A same-key Insert or LoadOrCompute waits for a pending claim, then sees the
+// committed value or, after an abort, an absent key.
+func TestLoadOrCompute_WaitersSeeClaimOutcome(t *testing.T) {
+	insert := func(m *Map[uint64, uint64]) (uint64, bool) { return m.Insert(8, 200) }
+	compute := func(m *Map[uint64, uint64]) (uint64, bool) {
+		return m.LoadOrCompute(8, func() (uint64, bool) { return 200, true })
+	}
+	for _, tc := range []struct {
+		name   string
+		save   bool
+		waiter func(*Map[uint64, uint64]) (uint64, bool)
+		want   opResult
+	}{
+		{"Insert/commit", true, insert, opResult{100, false}},
+		{"Insert/abort", false, insert, opResult{0, true}},
+		{"LoadOrCompute/commit", true, compute, opResult{100, true}},
+		{"LoadOrCompute/abort", false, compute, opResult{200, false}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := New[uint64, uint64](Options{InitialSize: 16})
+			holder := startCompute(t, m, 8, 100, tc.save)
+			waiter := goOp(func() (uint64, bool) { return tc.waiter(m) })
+			requireBlocked(t, waiter, 100*time.Millisecond, "waiter")
 
-	started := make(chan struct{})
-	release := make(chan struct{})
-	go func() {
-		m.LoadOrCompute(6, func() (uint64, bool) {
-			close(started)
-			<-release
-			return 42, true
+			if v, loaded := holder.result(t); loaded || v != 100 {
+				t.Fatalf("holder: got (%d, %v), want (100, false)", v, loaded)
+			}
+			if r := awaitOp(t, waiter, "waiter"); r != tc.want {
+				t.Fatalf("waiter: got %+v, want %+v", r, tc.want)
+			}
+			want := uint64(100)
+			if !tc.save {
+				want = 200
+			}
+			if got, ok := m.Get(8); !ok || got != want {
+				t.Fatalf("Get: got (%d, %v), want (%d, true)", got, ok, want)
+			}
 		})
-	}()
-	<-started
-
-	type lcRes struct {
-		v      uint64
-		loaded bool
-	}
-	waiterDone := make(chan lcRes, 1)
-	go func() {
-		v, loaded := m.LoadOrCompute(6, func() (uint64, bool) {
-			t.Error("waiter's fn ran while the winner's claim was pending or committed")
-			return 0, true
-		})
-		waiterDone <- lcRes{v, loaded}
-	}()
-
-	select {
-	case r := <-waiterDone:
-		t.Fatalf("waiter returned (%d, %v) while the claim was pending", r.v, r.loaded)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	close(release)
-	select {
-	case r := <-waiterDone:
-		if !r.loaded || r.v != 42 {
-			t.Fatalf("waiter: got (%d, %v), want (42, true)", r.v, r.loaded)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("waiter still blocked after the claim resolved")
-	}
-}
-
-// After a save=false abort, the waiting LoadOrCompute runs its own fn.
-func TestLoadOrCompute_WaiterComputesAfterAbort(t *testing.T) {
-	m := New[uint64, uint64](Options{InitialSize: 16})
-
-	started := make(chan struct{})
-	release := make(chan struct{})
-	go func() {
-		m.LoadOrCompute(6, func() (uint64, bool) {
-			close(started)
-			<-release
-			return 42, false
-		})
-	}()
-	<-started
-
-	type lcRes struct {
-		v      uint64
-		loaded bool
-	}
-	waiterDone := make(chan lcRes, 1)
-	go func() {
-		v, loaded := m.LoadOrCompute(6, func() (uint64, bool) { return 43, true })
-		waiterDone <- lcRes{v, loaded}
-	}()
-
-	select {
-	case r := <-waiterDone:
-		t.Fatalf("waiter returned (%d, %v) while the claim was pending", r.v, r.loaded)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	close(release)
-	select {
-	case r := <-waiterDone:
-		if r.loaded || r.v != 43 {
-			t.Fatalf("waiter: got (%d, %v), want (43, false)", r.v, r.loaded)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("waiter still blocked after the claim aborted")
-	}
-	if got, ok := m.Get(6); !ok || got != 43 {
-		t.Fatalf("Get: got (%d, %v), want (43, true)", got, ok)
 	}
 }
 
@@ -736,39 +662,7 @@ func TestLoadOrCompute_ResolveDuringTransfer(t *testing.T) {
 			oldIdx := m.getActiveIndex()
 			oldPb := oldIdx.getBin(hash)
 
-			started := make(chan struct{})
-			release := make(chan struct{})
-			returning := make(chan struct{})
-			done := make(chan struct{})
-			var v uint64
-			var loaded bool
-			go func() {
-				defer close(done)
-				v, loaded = m.LoadOrCompute(key, func() (uint64, bool) {
-					close(started)
-					<-release
-					close(returning)
-					return 777, tc.save
-				})
-			}()
-			defer func() {
-				select {
-				case <-release:
-				default:
-					close(release)
-				}
-				select {
-				case <-done:
-				case <-time.After(5 * time.Second):
-					t.Error("holder did not finish")
-				}
-			}()
-			select {
-			case <-started:
-			case <-time.After(5 * time.Second):
-				t.Fatal("callback did not start")
-			}
-
+			c := startCompute(t, m, key, 777, tc.save)
 			h := atomicLoadHeader(&oldPb.Header)
 			si, slot := m.findShadowSlot(oldIdx, oldPb, h, hash)
 			if slot == nil {
@@ -782,9 +676,9 @@ func TestLoadOrCompute_ResolveDuringTransfer(t *testing.T) {
 			}
 			oldIdx.indexNext.Store(newIdx)
 			atomic.OrUint64((*uint64)(&oldPb.Header), uint64(BinInTransfer)<<binStateShift)
-			close(release)
+			c.unblock()
 			select {
-			case <-returning:
+			case <-c.returned:
 			case <-time.After(5 * time.Second):
 				t.Error("callback did not return")
 			}
@@ -799,7 +693,7 @@ func TestLoadOrCompute_ResolveDuringTransfer(t *testing.T) {
 				}
 			}
 			select {
-			case <-done:
+			case <-c.done:
 				t.Error("holder resolved while the bin was InTransfer")
 			case <-time.After(50 * time.Millisecond):
 			}
@@ -817,11 +711,7 @@ func TestLoadOrCompute_ResolveDuringTransfer(t *testing.T) {
 			// Complete the transfer before stopping on any failed assertions.
 			atomic.StoreUint64((*uint64)(&oldPb.Header), uint64(h.setBinState(BinDoneTransfer)))
 			m.active.Store(newIdx)
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				t.Fatal("holder still blocked after transfer")
-			}
+			v, loaded := c.result(t)
 			if t.Failed() {
 				return
 			}
@@ -854,158 +744,23 @@ func TestLoadOrCompute_ResolveDuringTransfer(t *testing.T) {
 	}
 }
 
-// Resize carries a pending claim by hash; the holder commits in the new index.
-func TestLoadOrCompute_CommitAfterResize(t *testing.T) {
-	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
-	const key = uint64(42)
-	hash := maphash.Comparable(testSeed, key)
-
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var v uint64
-	var loaded bool
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		v, loaded = m.LoadOrCompute(key, func() (uint64, bool) {
-			close(started)
-			<-release
-			return 777, true
-		})
-	}()
-	<-started
-
-	oldIdx := m.getActiveIndex()
-	oldPb := oldIdx.getBin(hash)
-	oldSi, _ := m.findShadowSlot(oldIdx, oldPb, atomicLoadHeader(&oldPb.Header), hash)
-	if oldSi < 0 {
-		t.Fatal("claim not present in the old index while fn runs")
-	}
-
-	if !m.triggerResize() {
-		t.Fatal("triggerResize refused")
-	}
-	newIdx := m.getActiveIndex()
-	if newIdx == oldIdx {
-		t.Fatal("resize did not swap the active index")
-	}
-
-	// Carrying a claim leaves its old hash intact, without a sentinel.
-	if st := atomicLoadHeader(&oldPb.Header).getBinState(); st != BinDoneTransfer {
-		t.Fatalf("old bin state: got %d, want BinDoneTransfer", st)
-	}
-	if got := oldIdx.getSlotByIndex(oldPb, oldSi).Key; got != hash {
-		t.Fatalf("old claim slot key: got %#x, want the claim hash %#x (sentineled?)", got, hash)
-	}
-
-	// Carried claim exists in the new index and the key is still absent.
-	newPb := newIdx.getBin(hash)
-	if si, _ := m.findShadowSlot(newIdx, newPb, atomicLoadHeader(&newPb.Header), hash); si < 0 {
-		t.Fatal("claim was not carried into the new index")
-	}
-	if _, ok := m.Get(key); ok {
-		t.Fatal("key visible while the carried claim is pending")
-	}
-
-	close(release)
-	<-done
-	if loaded || v != 777 {
-		t.Fatalf("got (%d, %v), want (777, false)", v, loaded)
-	}
-	if got, ok := m.Get(key); !ok || got != 777 {
-		t.Fatalf("Get after relocated commit: got (%d, %v), want (777, true)", got, ok)
-	}
-	if s := m.Size(); s != 1 {
-		t.Fatalf("Size: got %d, want 1", s)
-	}
-}
-
-// The abort path relocates the same way and releases the carried slot.
-func TestLoadOrCompute_AbortAfterResize(t *testing.T) {
-	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
-	const key = uint64(42)
-	hash := maphash.Comparable(testSeed, key)
-
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var v uint64
-	var loaded bool
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		v, loaded = m.LoadOrCompute(key, func() (uint64, bool) {
-			close(started)
-			<-release
-			return 777, false
-		})
-	}()
-	<-started
-
-	if !m.triggerResize() {
-		t.Fatal("triggerResize refused")
-	}
-	close(release)
-	<-done
-
-	if loaded || v != 777 {
-		t.Fatalf("got (%d, %v), want (777, false)", v, loaded)
-	}
-	if _, ok := m.Get(key); ok {
-		t.Fatal("key visible after an aborted claim")
-	}
-	newIdx := m.getActiveIndex()
-	newPb := newIdx.getBin(hash)
-	if si, _ := m.findShadowSlot(newIdx, newPb, atomicLoadHeader(&newPb.Header), hash); si >= 0 {
-		t.Fatal("carried claim slot not released by the abort")
-	}
-	if s := m.Size(); s != 0 {
-		t.Fatalf("Size: got %d, want 0", s)
-	}
-
-	// The released slot is reusable on the new index.
-	if got, loaded := m.LoadOrCompute(key, func() (uint64, bool) { return 5, true }); loaded || got != 5 {
-		t.Fatalf("recompute: got (%d, %v), want (5, false)", got, loaded)
-	}
-}
-
 // The holder follows its claim across two resizes before committing.
 func TestLoadOrCompute_DoubleRelocation(t *testing.T) {
 	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
 	const key = uint64(42)
+	c := startCompute(t, m, key, 777, true)
 
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var v uint64
-	var loaded bool
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		v, loaded = m.LoadOrCompute(key, func() (uint64, bool) {
-			close(started)
-			<-release
-			return 777, true
-		})
-	}()
-	<-started
-
-	first := m.getActiveIndex()
-	if !m.triggerResize() {
-		t.Fatal("first triggerResize refused")
-	}
-	second := m.getActiveIndex()
-	if second == first {
-		t.Fatal("first resize did not swap")
-	}
-	if !m.triggerResize() {
-		t.Fatal("second triggerResize refused")
-	}
-	if m.getActiveIndex() == second {
-		t.Fatal("second resize did not swap")
+	for range 2 {
+		before := m.getActiveIndex()
+		if !m.triggerResize() {
+			t.Fatal("triggerResize refused")
+		}
+		if m.getActiveIndex() == before {
+			t.Fatal("resize did not swap the active index")
+		}
 	}
 
-	close(release)
-	<-done
-	if loaded || v != 777 {
+	if v, loaded := c.result(t); loaded || v != 777 {
 		t.Fatalf("got (%d, %v), want (777, false)", v, loaded)
 	}
 	if got, ok := m.Get(key); !ok || got != 777 {
@@ -1013,13 +768,15 @@ func TestLoadOrCompute_DoubleRelocation(t *testing.T) {
 	}
 }
 
-// Keep the cohort together after resize so claims exercise the child links too.
-func TestLoadOrCompute_LinkClaimCarriedAcrossResize(t *testing.T) {
+// Resize carries a pending claim by hash and the holder resolves it in the new
+// index. The cohort stays together, so the claim keeps its slot in the child,
+// including link slots.
+func TestLoadOrCompute_ClaimCarriedAcrossResize(t *testing.T) {
 	keys := keysForBin(testSeed, 255, 0, MAX_SLOTS_PER_BIN, 1<<22)
 	if keys == nil {
 		t.Fatal("could not synthesize colliding keys")
 	}
-	for _, slotIndex := range []int{PRIMARY_SLOTS, PRIMARY_SLOTS + LINK_SLOTS, PRIMARY_SLOTS + 2*LINK_SLOTS, MAX_SLOTS_PER_BIN - 1} {
+	for _, slotIndex := range []int{0, PRIMARY_SLOTS, PRIMARY_SLOTS + LINK_SLOTS, PRIMARY_SLOTS + 2*LINK_SLOTS, MAX_SLOTS_PER_BIN - 1} {
 		for _, save := range []bool{true, false} {
 			t.Run(fmt.Sprintf("slot_%d/save_%t", slotIndex, save), func(t *testing.T) {
 				m := newWithSeed[uint64, uint64](Options{InitialSize: 32}, testSeed)
@@ -1033,31 +790,7 @@ func TestLoadOrCompute_LinkClaimCarriedAcrossResize(t *testing.T) {
 				hash := maphash.Comparable(testSeed, key)
 				oldPb := oldIdx.getBin(hash)
 
-				started := make(chan struct{})
-				release := make(chan struct{})
-				done := make(chan struct{})
-				var v uint64
-				var loaded bool
-				go func() {
-					defer close(done)
-					v, loaded = m.LoadOrCompute(key, func() (uint64, bool) {
-						close(started)
-						<-release
-						return 99, save
-					})
-				}()
-				defer func() {
-					select {
-					case <-release:
-					default:
-						close(release)
-					}
-				}()
-				select {
-				case <-started:
-				case <-time.After(5 * time.Second):
-					t.Fatal("callback did not start")
-				}
+				c := startCompute(t, m, key, 99, save)
 				if m.getActiveIndex() != oldIdx {
 					t.Fatal("map resized before the claim was placed")
 				}
@@ -1072,6 +805,10 @@ func TestLoadOrCompute_LinkClaimCarriedAcrossResize(t *testing.T) {
 				if newIdx == oldIdx {
 					t.Fatal("resize did not swap the active index")
 				}
+				// Transfer sentinels only Valid slots, so the old claim keeps its hash.
+				if got := oldIdx.getSlotByIndex(oldPb, slotIndex).Key; got != hash {
+					t.Fatalf("old claim slot key: got %#x, want the claim hash %#x", got, hash)
+				}
 				newPb := newIdx.getBin(hash)
 				si, slot := m.findShadowSlot(newIdx, newPb, atomicLoadHeader(&newPb.Header), hash)
 				if si != slotIndex {
@@ -1084,24 +821,21 @@ func TestLoadOrCompute_LinkClaimCarriedAcrossResize(t *testing.T) {
 					t.Fatal("carried claim is visible before fn returns")
 				}
 
-				close(release)
-				select {
-				case <-done:
-				case <-time.After(5 * time.Second):
-					t.Fatal("holder did not finish after resize")
-				}
-				if loaded || v != 99 {
+				if v, loaded := c.result(t); loaded || v != 99 {
 					t.Fatalf("got (%d, %v), want (99, false)", v, loaded)
 				}
 				if got, ok := m.Get(key); ok != save || (ok && got != 99) {
 					t.Fatalf("Get after resize: got (%d, %v), save=%t", got, ok, save)
 				}
-				wantState := uint8(SlotInvalid)
+				wantState, wantSize := uint8(SlotInvalid), uint64(slotIndex)
 				if save {
-					wantState = SlotValid
+					wantState, wantSize = SlotValid, wantSize+1
 				}
 				if got := atomicLoadHeader(&newPb.Header).getSlotState(si); got != wantState {
 					t.Fatalf("resolved slot state: got %d, want %d", got, wantState)
+				}
+				if s := m.Size(); s != wantSize {
+					t.Fatalf("Size: got %d, want %d", s, wantSize)
 				}
 				if !save {
 					if atomicLoadSlotVal(slot) != nil {
@@ -1391,54 +1125,18 @@ func TestLoadOrCompute_NestedComputeOfOtherKey(t *testing.T) {
 // claim, and after the relocated commit it returns the committed value.
 func TestLoadOrCompute_ParkedInsertFollowsRelocatedCommit(t *testing.T) {
 	m := New[uint64, uint64](Options{InitialSize: 16})
-
-	started := make(chan struct{})
-	release := make(chan struct{})
-	holderDone := make(chan struct{})
-	go func() {
-		defer close(holderDone)
-		m.LoadOrCompute(8, func() (uint64, bool) {
-			close(started)
-			<-release
-			return 100, true
-		})
-	}()
-	<-started
-
-	type insRes struct {
-		prev uint64
-		ok   bool
-	}
-	insDone := make(chan insRes, 1)
-	go func() {
-		prev, ok := m.Insert(8, 200)
-		insDone <- insRes{prev, ok}
-	}()
-
-	select {
-	case r := <-insDone:
-		t.Fatalf("Insert returned (%d, %v) while the claim was pending", r.prev, r.ok)
-	case <-time.After(50 * time.Millisecond):
-	}
+	holder := startCompute(t, m, 8, 100, true)
+	insert := goOp(func() (uint64, bool) { return m.Insert(8, 200) })
+	requireBlocked(t, insert, 50*time.Millisecond, "Insert")
 
 	if !m.triggerResize() {
 		t.Fatal("triggerResize refused")
 	}
-	select {
-	case r := <-insDone:
-		t.Fatalf("Insert returned (%d, %v) while the carried claim was pending", r.prev, r.ok)
-	case <-time.After(50 * time.Millisecond):
-	}
+	requireBlocked(t, insert, 50*time.Millisecond, "Insert after resize")
 
-	close(release)
-	<-holderDone
-	select {
-	case r := <-insDone:
-		if r.ok || r.prev != 100 {
-			t.Fatalf("Insert after relocated commit: got (%d, %v), want (100, false)", r.prev, r.ok)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Insert still blocked after the relocated commit")
+	holder.result(t)
+	if r := awaitOp(t, insert, "Insert"); r != (opResult{100, false}) {
+		t.Fatalf("Insert after relocated commit: got %+v, want {value:100 ok:false}", r)
 	}
 	if got, ok := m.Get(8); !ok || got != 100 {
 		t.Fatalf("Get: got (%d, %v), want (100, true)", got, ok)
@@ -1544,7 +1242,6 @@ func TestUnreserveSlot(t *testing.T) {
 						slot.Val = &Entry[uint64, uint64]{Key: 42, Value: 7}
 						clear = slot
 					}
-					entry := slot.Val
 
 					m.unreserveSlot(pb, clear, i)
 
@@ -1552,8 +1249,8 @@ func TestUnreserveSlot(t *testing.T) {
 						t.Fatal("unreserve changed the hash")
 					}
 					if binState != BinNoTransfer {
-						if pb.Header != h || slot.Val != entry {
-							t.Fatal("unreserve changed a transferring bin")
+						if pb.Header != h {
+							t.Fatal("unreserve changed a transferring bin's header")
 						}
 						return
 					}

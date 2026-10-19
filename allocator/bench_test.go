@@ -29,7 +29,6 @@ func prefilledMap(keys []uint64) *Map[uint64, uint64] {
 func BenchmarkGetHit(b *testing.B) {
 	keys := benchKeys()
 	m := prefilledMap(keys)
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		if _, ok := m.Get(keys[i&(benchKeyspace-1)]); !ok {
 			b.Fatal("miss")
@@ -40,7 +39,6 @@ func BenchmarkGetHit(b *testing.B) {
 func BenchmarkGetMiss(b *testing.B) {
 	keys := benchKeys()
 	m := prefilledMap(keys)
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		if _, ok := m.Get(uint64(i) | 1<<63); ok {
 			b.Fatal("unexpected hit")
@@ -52,7 +50,6 @@ func BenchmarkGetMiss(b *testing.B) {
 func BenchmarkInsertDelete(b *testing.B) {
 	keys := benchKeys()
 	m := prefilledMap(keys)
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		k := uint64(i) | 1<<62 | 1<<63
 		if _, ok := m.Insert(k, k); !ok {
@@ -68,7 +65,6 @@ func BenchmarkInsertDelete(b *testing.B) {
 func BenchmarkInsertExisting(b *testing.B) {
 	keys := benchKeys()
 	m := prefilledMap(keys)
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		if _, ok := m.Insert(keys[i&(benchKeyspace-1)], 0); ok {
 			b.Fatal("unexpected insert")
@@ -79,7 +75,6 @@ func BenchmarkInsertExisting(b *testing.B) {
 func BenchmarkPutExisting(b *testing.B) {
 	keys := benchKeys()
 	m := prefilledMap(keys)
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		if _, ok := m.Put(keys[i&(benchKeyspace-1)], uint64(i)); !ok {
 			b.Fatal("put missed")
@@ -92,7 +87,6 @@ func BenchmarkLoadOrComputeHit(b *testing.B) {
 	keys := benchKeys()
 	m := prefilledMap(keys)
 	fn := func() (uint64, bool) { b.Fatal("fn ran on hit path"); return 0, false }
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		if _, loaded := m.LoadOrCompute(keys[i&(benchKeyspace-1)], fn); !loaded {
 			b.Fatal("miss")
@@ -104,7 +98,6 @@ func BenchmarkLoadOrComputeHit(b *testing.B) {
 func BenchmarkLoadOrComputeCompute(b *testing.B) {
 	keys := benchKeys()
 	m := prefilledMap(keys)
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		k := uint64(i) | 1<<62 | 1<<63
 		if _, loaded := m.LoadOrCompute(k, func() (uint64, bool) { return k, true }); loaded {
