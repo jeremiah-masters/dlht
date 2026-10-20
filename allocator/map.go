@@ -91,14 +91,12 @@ func (m *Map[K, V]) Size() uint64 {
 // validSlotCount sums Valid slots across all primary bins via one
 // atomic header load per bin.
 //
-// Count pairs with both bits set; pending compute claims are not entries.
+// Pending compute claims are not entries, so only Valid slots count.
 func (idx *index[K, V]) validSlotCount() uint64 {
-	const lowBits uint32 = 0x15555555 // low bit of each of the 15 pairs
 	var n uint64
 	for i := range idx.bins {
 		h := atomicLoadHeader(&idx.bins[i].Header)
-		s := uint32(h)
-		n += uint64(bits.OnesCount32((s & (s >> 1)) & lowBits))
+		n += uint64(bits.OnesCount32(h.validMaskAll()))
 	}
 	return n
 }

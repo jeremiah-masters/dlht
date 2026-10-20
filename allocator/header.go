@@ -73,6 +73,13 @@ func (h Header) validMask4(base uint) uint32 {
 	return (s & (s >> 1)) & 0x55
 }
 
+// validMaskAll returns the Valid slots across the bin, at bits 0, 2, ..., 28.
+// The mask excludes the bin-state bits.
+func (h Header) validMaskAll() uint32 {
+	s := uint32(h)
+	return (s & (s >> 1)) & 0x15555555
+}
+
 // shadowMask3 returns a spread bitmask (bits 0, 2, 4) of the first 3 slots in
 // Shadow state (0b10): high bit set, low bit clear.
 func (h Header) shadowMask3() uint32 {

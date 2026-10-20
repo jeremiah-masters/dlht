@@ -1,6 +1,9 @@
 package allocator
 
-import "testing"
+import (
+	"math/rand/v2"
+	"testing"
+)
 
 func TestHeaderSlotStates(t *testing.T) {
 	for i := range MAX_SLOTS_PER_BIN {
@@ -110,5 +113,20 @@ func TestHeaderMasks_ShadowExactness(t *testing.T) {
 	}
 	if got, want := h3.validMask4(PRIMARY_SLOTS+2*LINK_SLOTS), uint32(0x00); got != want {
 		t.Errorf("validMask4(11) slot14 Shadow: got %#x, want %#x", got, want)
+	}
+}
+
+// Range slices validMaskAll per bucket, so it must agree with the bucket masks.
+func TestHeaderValidMaskAll(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range 100_000 {
+		h := Header(rng.Uint64()) // any slot states, bin state and version
+		want := h.validMask3() |
+			h.validMask4(PRIMARY_SLOTS)<<(2*PRIMARY_SLOTS) |
+			h.validMask4(PRIMARY_SLOTS+LINK_SLOTS)<<(2*(PRIMARY_SLOTS+LINK_SLOTS)) |
+			h.validMask4(PRIMARY_SLOTS+2*LINK_SLOTS)<<(2*(PRIMARY_SLOTS+2*LINK_SLOTS))
+		if got := h.validMaskAll(); got != want {
+			t.Fatalf("validMaskAll(%#x): got %#x, want %#x", h, got, want)
+		}
 	}
 }
