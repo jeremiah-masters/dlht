@@ -4,6 +4,7 @@ import (
 	"hash/maphash"
 	"math/bits"
 	"runtime"
+	"time"
 
 	"github.com/jeremiah-masters/dlht/internal/cpu"
 )
@@ -18,8 +19,10 @@ import (
 // intervening Delete, later callers load the current value without running fn.
 //
 // Claims are matched by their 64-bit hash, so hash collisions also serialize
-// callers. Keep fn short: waiters spin and yield. fn must not call Insert or
-// LoadOrCompute on this map for the same key or a key with the same hash.
+// callers. Waiters spin briefly, then sleep for an eighth of the time they
+// have waited so far, up to 10ms: a slow fn costs them little CPU, and they
+// see its result at most that long after it returns. fn must not call Insert
+// or LoadOrCompute on this map for the same key or a key with the same hash.
 // Calls for other keys, including calls that trigger resize, are supported,
 // but cyclic dependencies between callbacks deadlock. Get, Put, and Delete
 // are safe to call from fn for any key.
@@ -81,8 +84,8 @@ retry:
 
 	// Wait for a pending compute with the same hash before reserving a slot.
 	if h0.shadowMaskAll() != 0 {
-		if si, _ := m.findShadowSlot(idx, pb, h0, hash); si >= 0 {
-			m.waitForClaim(pb, si)
+		if si, slot := m.findShadowSlot(idx, pb, h0, hash); slot != nil {
+			m.waitForClaim(pb, si, slot, hash)
 			goto retry
 		}
 	}
@@ -184,11 +187,32 @@ func (m *Map[K, V]) publishClaim(pb *PrimaryBucket[K, V], oldH Header, i int) bo
 	return atomicCASHeader(&pb.Header, oldH, newH)
 }
 
-// waitForClaim spins briefly, then yields if the observed slot is still Shadow.
-func (m *Map[K, V]) waitForClaim(pb *PrimaryBucket[K, V], i int) {
-	cpu.Yield()
-	if atomicLoadHeader(&pb.Header).getSlotState(i) == SlotShadow {
-		runtime.Gosched()
+// maxClaimWait caps the sleep between checks of a pending claim.
+const maxClaimWait = 10 * time.Millisecond
+
+// waitForClaim returns once the claim for hash in slot i resolves or the bin
+// starts moving. It spins, then yields, then sleeps for an eighth of the time
+// it has waited so far, up to maxClaimWait. A short compute is noticed within
+// microseconds; a long one costs almost no CPU and is noticed at most about
+// 12% late.
+func (m *Map[K, V]) waitForClaim(pb *PrimaryBucket[K, V], i int, slot *Slot[K, V], hash uint64) {
+	var start time.Time
+	for n := 0; ; n++ {
+		h := atomicLoadHeader(&pb.Header)
+		if h.getBinState() != BinNoTransfer || h.getSlotState(i) != SlotShadow || slot.Key != hash {
+			return
+		}
+		switch {
+		case n < 8:
+			cpu.Yield()
+		case n < 16:
+			runtime.Gosched()
+		default:
+			if start.IsZero() {
+				start = time.Now()
+			}
+			time.Sleep(min(max(time.Since(start)/8, time.Microsecond), maxClaimWait))
+		}
 	}
 }
 

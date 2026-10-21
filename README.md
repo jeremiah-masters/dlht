@@ -90,7 +90,7 @@ func main() {
 
 LoadOrCompute serializes computes for each 64-bit hash. Insert and LoadOrCompute callers of an absent key wait for a pending compute with that hash; Get, Put, Delete, and Range treat the pending key as absent. A `save=true` result is inserted before LoadOrCompute returns. Once inserted, a concurrent Put or Delete can change it before the call returns.
 
-Keep `fn` short and let it return normally. A panic or `runtime.Goexit` leaves its claim pending, so later Insert and LoadOrCompute calls with that hash can wait forever. Recover inside `fn` and return `save=false` to release the claim after a panic. Within `fn`, do not Insert or LoadOrCompute the same key or another key with the same hash, and avoid cyclic waits between callbacks.
+Callers waiting on `fn` spin briefly, then sleep, so a slow `fn` costs them little CPU; they see its result at most about an eighth of its running time late (never more than 10ms). Let `fn` return normally. A panic or `runtime.Goexit` leaves its claim pending, so later Insert and LoadOrCompute calls with that hash can wait forever. Recover inside `fn` and return `save=false` to release the claim after a panic. Within `fn`, do not Insert or LoadOrCompute the same key or another key with the same hash, and avoid cyclic waits between callbacks.
 
 ## Implementation Details
 

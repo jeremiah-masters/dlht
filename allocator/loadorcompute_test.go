@@ -646,6 +646,53 @@ func TestLoadOrCompute_WaitersSeeClaimOutcome(t *testing.T) {
 	}
 }
 
+// A sleeping waiter must notice every way its claim can go away. A dead bin
+// keeps its Shadow bits forever, and a reused slot can be Shadow for another
+// hash, so watching the slot state alone would wait forever.
+func TestWaitForClaim(t *testing.T) {
+	const hash, other = uint64(0x1234), uint64(0x5678)
+	for _, tc := range []struct {
+		name   string
+		change func(pb *PrimaryBucket[uint64, uint64], slot *Slot[uint64, uint64])
+	}{
+		{"resolved", func(pb *PrimaryBucket[uint64, uint64], _ *Slot[uint64, uint64]) {
+			h := atomicLoadHeader(&pb.Header)
+			atomicCASHeader(&pb.Header, h, h.setSlotStateAndVersion(1, SlotValid))
+		}},
+		{"slot claimed for another hash", func(_ *PrimaryBucket[uint64, uint64], slot *Slot[uint64, uint64]) {
+			atomic.StoreUint64(&slot.Key, other)
+		}},
+		{"bin in transfer", func(pb *PrimaryBucket[uint64, uint64], _ *Slot[uint64, uint64]) {
+			atomic.OrUint64((*uint64)(&pb.Header), uint64(BinInTransfer)<<binStateShift)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := New[uint64, uint64](Options{InitialSize: 16})
+			pb := m.getActiveIndex().getBinByIndex(0)
+			slot := pb.slotAt(1)
+			slot.Key = hash
+			pb.Header = pb.Header.setSlotStateAndVersion(1, SlotShadow)
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				m.waitForClaim(pb, 1, slot, hash)
+			}()
+			select {
+			case <-done:
+				t.Fatal("waitForClaim returned while the claim was pending")
+			case <-time.After(20 * time.Millisecond): // past the spin phase, so asleep
+			}
+			tc.change(pb, slot)
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("waitForClaim still waiting after the claim went away")
+			}
+		})
+	}
+}
+
 // A holder must wait out InTransfer even after storing its computed entry.
 func TestLoadOrCompute_ResolveDuringTransfer(t *testing.T) {
 	for _, tc := range []struct {

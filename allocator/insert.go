@@ -64,8 +64,8 @@ retry:
 
 	// Wait for a pending compute with the same hash before reserving a slot.
 	if h0.shadowMaskAll() != 0 {
-		if si, _ := m.findShadowSlot(idx, pb, h0, hash); si >= 0 {
-			m.waitForClaim(pb, si)
+		if si, slot := m.findShadowSlot(idx, pb, h0, hash); slot != nil {
+			m.waitForClaim(pb, si, slot, hash)
 			goto retry
 		}
 	}
