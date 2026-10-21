@@ -6,6 +6,8 @@ DLHT implements a lock-free concurrent hash table based on the DLHT algorithm fr
 
 The fundamental challenge of concurrent hash tables is allowing multiple threads to read and write simultaneously without corrupting data or losing updates. Traditional approaches use locks, which serialize access and limit scalability. DLHT instead uses atomic operations and careful memory ordering to achieve lock-freedom: no thread holds a lock that could block others, so the system as a whole always makes progress—even though an individual operation may retry under contention while other threads succeed.
 
+There are two exceptions. During a resize, an operation on a bin that another thread is copying waits for the copy to finish, and an insertion into a full bin waits for the resize to complete (see "Growing: Cooperative Resize"). And while a LoadOrCompute value function runs, Insert and LoadOrCompute calls with the same 64-bit hash wait for it to return (see "Computing: LoadOrCompute and the Shadow Claim").
+
 ---
 
 ## The Core Insight: Separating Visibility from Data
@@ -777,7 +779,7 @@ ctx.chunkClaimed  ──▶  (atomic FAA +1 per claim)
 
 Each claimed chunk is transferred (`transferChunk` re-hashes its 1024 old bins into the new index), after which the thread performs a second FAA on `ctx.chunksDone`. The thread whose FAA brings `chunksDone` to `k` is the finalizer: it updates `newIdx.linkCapacity` to reflect the unused link budget, stores `newIdx` into `m.active`, flips the context's `active` back to `ResizeInactive`, clears `resizeCtx`, and releases its references to the old and new indexes so the old index becomes garbage-collectable.
 
-This work-stealing pattern ensures no thread can block progress. If Thread A stalls mid-chunk, Threads B and C continue with other chunks. Eventually, someone will complete Thread A's chunk (or Thread A will resume).
+Work-stealing spreads the transfer across threads, but a chunk belongs to the thread that claimed it. If Thread A stalls mid-chunk, Threads B and C continue with other chunks, and operations on bins A has not reached yet keep using the old index. Two things wait for A to resume: operations on the bin A is copying, and the switch to the new index, which insertions into full bins are waiting for.
 
 ### Helping During Resize
 
@@ -795,7 +797,7 @@ for {
 }
 ```
 
-Inserts call `helpResize` immediately after triggering (so the triggering thread itself participates), and operations that encounter `BinInTransfer` effectively help by contending on the same chunk counter. The `ResizeReserved` state handles the narrow window between the placeholder CAS and the real context being published—helpers yield rather than busy-looping on unpopulated metadata.
+Inserts call `helpResize` immediately after triggering (so the triggering thread itself participates). Operations that encounter `BinInTransfer` don't help; they back off and retry (see "Operation Behavior During Resize"). The `ResizeReserved` state handles the narrow window between the placeholder CAS and the real context being published—helpers yield rather than busy-looping on unpopulated metadata.
 
 ### Transferring a Bin
 
@@ -887,7 +889,7 @@ Operations encountering a bin mid-transfer behave according to bin state:
 
 **BinNoTransfer (00):** Normal operation. Proceed as usual.
 
-**BinInTransfer (01):** The bin is being transferred. The operation backs off politely and retries from the top: first `cpu.Yield()` (a cheap PAUSE / YIELD spin hint), then a re-check of the bin state; if still `BinInTransfer`, escalate to `runtime.Gosched()` to give the scheduler a chance to run the transferring goroutine. Either way, reload `m.active` and retry—by the time the operation runs again the bin is typically already `BinDoneTransfer`, or the resize is done and the operation finds itself on the new index.
+**BinInTransfer (01):** The bin is being transferred. The operation backs off politely and retries from the top: first `cpu.Yield()` (a cheap PAUSE / YIELD spin hint), then a re-check of the bin state; if still `BinInTransfer`, escalate to `runtime.Gosched()` to give the scheduler a chance to run the transferring goroutine. Either way, reload `m.active` and retry—by the time the operation runs again the bin is typically already `BinDoneTransfer`, or the resize is done and the operation finds itself on the new index. If the transferring goroutine is descheduled mid-bin, operations on that bin keep backing off until it runs again; a bin holds at most 15 entries, so the copy itself is short.
 
 **BinDoneTransfer (10):** Transfer complete for this bin. All operations must redirect to the new index. They follow `idx.indexNext` to the next generation (*not* `m.active`—see "Initiating Resize" above for why multi-generation laggards must walk the chain) and retry there.
 
@@ -1048,8 +1050,8 @@ DLHT achieves high-performance concurrent hash table operations through several 
 
 **DWCAS** provides the linearization point for both Put and Delete, atomically reading the old value while writing the new one (or nil). The 128-bit atomic operation is the key to both safe in-place updates and returning correct previous values.
 
-**Cooperative resize** distributes work among threads via atomic work-stealing. No single thread can block progress.
+**Cooperative resize** distributes work among threads via atomic work-stealing. A stalled thread holds up only the bin it is copying and the final switch to the new index.
 
 **Strategic memory ordering** uses plain loads where safe and atomics where necessary. The result is both correct and fast.
 
-The design prioritizes read performance (the most common operation) while maintaining linearizability under arbitrary concurrency. The bounded overflow ensures predictable worst-case performance, and the cooperative resize ensures the table can grow without blocking operations.
+The design prioritizes read performance (the most common operation) while maintaining linearizability under arbitrary concurrency. The bounded overflow ensures predictable worst-case performance, and the cooperative resize lets the table grow while operations continue; only operations on a bin being copied, and insertions into full bins, wait for it.

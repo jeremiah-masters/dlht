@@ -1,9 +1,9 @@
 // Package dlht provides DLHT, a high-performance lock-free hash table.
 //
 // DLHT provides linearizable Get, Insert, Delete, Put, and LoadOrCompute
-// operations with cooperative resizing. LoadOrCompute runs a value function
-// for an absent key; Insert and LoadOrCompute wait for pending computes with
-// the same 64-bit hash. Get, Put, and Delete remain lock-free.
+// operations with cooperative resizing. Get, Insert, Put, and Delete are
+// lock-free. LoadOrCompute runs a value function for an absent key; while it
+// runs, Insert and LoadOrCompute calls with the same 64-bit hash wait for it.
 //
 // Example usage:
 //

@@ -1,10 +1,10 @@
 # DLHT
 
-DLHT is a high-performance hash table for high-concurrency workloads based on DLHT: A Non-blocking Resizable Hashtable with Fast Deletes and Memory-awareness (<https://arxiv.org/abs/2406.09986>). It provides Get, Insert, Delete, Put, and LoadOrCompute operations with cooperative resizing.
+DLHT is a high-performance, lock-free hash table for high-concurrency workloads based on DLHT: A Non-blocking Resizable Hashtable with Fast Deletes and Memory-awareness (<https://arxiv.org/abs/2406.09986>). It provides Get, Insert, Delete, Put, and LoadOrCompute operations with cooperative resizing.
 
 ## Features
 
-- **Linearizable operations**: Get, Insert, Delete, Put, and LoadOrCompute are linearizable. Get, Put, and Delete are lock-free; Insert and LoadOrCompute wait for pending computes with the same 64-bit hash
+- **Lock-free operations**: Get, Insert, Delete, and Put are lock-free, and every operation is linearizable. The exception is LoadOrCompute: while its value function runs, Insert and LoadOrCompute calls with the same 64-bit hash wait for it
 - **High concurrency**: Scales well with multiple threads and cores
 - **Automatic resizing**: Cooperative resize algorithm that doesn't block operations
 - **Memory efficient**: Cache-line optimized data structures with bounded overflow
@@ -103,7 +103,7 @@ This package provides a clean public API that wraps the allocator-based implemen
 
 DLHT is designed for high-performance concurrent workloads:
 
-- **Lock-free reads and updates**: Get, Put, and Delete do not wait for value functions
+- **Lock-free**: No blocking between operations, except Insert and LoadOrCompute calls waiting on a same-hash LoadOrCompute
 - **Cache-optimized**: 64-byte buckets fit exactly in cache lines
 - **Bounded overflow**: Maximum 15 slots per bucket for predictable performance
 - **Cooperative resizing**: Non-blocking resize with work-stealing
