@@ -1034,6 +1034,7 @@ Only Insert actively participates in resize. Get/Put/Delete that encounter a mid
 - Reads scale linearly with cores (no shared writes on the happy path)
 - Inserts contend on the bin's header cache line (reserve + finalize CASes); different bins are fully independent
 - Puts and Deletes contend on the *slot* cache line via DWCAS — concurrent updates to the same key serialize, but updates to different keys in the same bin don't (different 16-byte slot targets)
+- When a write's CAS or DWCAS fails, it pauses briefly (`cpu.Yield`) before retrying, so threads contending for a header or slot don't retry in lockstep. Writes that succeed on the first attempt never pause
 - Resize parallelizes across cores via work-stealing on `ctx.chunkClaimed`
 
 The bounded overflow (15 slots/bin) ensures predictable performance. Unlike chaining hash tables where a hot bucket can grow unboundedly, DLHT triggers resize before any bin overflows. This trades some space efficiency for worst-case time bounds.

@@ -86,6 +86,7 @@ retry:
 	// and the curKey check below routes it back to retry. Keep this in mind
 	// when the resize phase of the spec lands.
 	for {
+		cpu.Yield() // back off before retrying the DWCAS
 		hLoop := atomicLoadHeader(&pb.Header)
 		if hLoop.getSlotState(targetIdx) != SlotValid {
 			goto retry

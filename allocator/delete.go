@@ -85,6 +85,7 @@ retry:
 
 	// Step 6: Retry loop (only entered on eager DWCAS failure)
 	for {
+		cpu.Yield() // back off before retrying the DWCAS
 		hLoop := atomicLoadHeader(&pb.Header)
 		if hLoop.getBinState() != BinNoTransfer {
 			goto retry

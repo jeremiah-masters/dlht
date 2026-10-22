@@ -107,6 +107,7 @@ retry:
 	// Step 4: Reserve the slot (transition Invalid to Trying)
 	h1 := h0.setSlotStateAndVersion(slotIndex, SlotTrying)
 	if !m.reserveSlot(pb, h0, h1) {
+		cpu.Yield() // back off after a failed reserve
 		goto retry
 	}
 
@@ -121,6 +122,7 @@ retry:
 
 	// Keep the reservation on a failed publish, but rescan before retrying.
 retryWithSlot:
+	cpu.Yield() // back off before rescanning
 	h2 := atomicLoadHeader(&pb.Header)
 
 	if h2.getBinState() != BinNoTransfer {
@@ -229,6 +231,7 @@ func (m *Map[K, V]) computeAndResolve(idx *index[K, V], pb *PrimaryBucket[K, V],
 			if atomicCASHeader(&pb.Header, hLoop, hLoop+delta) {
 				return value, false
 			}
+			cpu.Yield() // back off after a failed resolve
 		case BinInTransfer:
 			cpu.Yield()
 			if atomicLoadHeader(&pb.Header).getBinState() == BinInTransfer {

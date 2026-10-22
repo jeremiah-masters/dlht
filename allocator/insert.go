@@ -90,6 +90,7 @@ retry:
 	// Step 4: Reserve the slot (transition Invalid to Trying)
 	h1 := h0.setSlotStateAndVersion(slotIndex, SlotTrying)
 	if !m.reserveSlot(pb, h0, h1) {
+		cpu.Yield() // back off after a failed reserve
 		goto retry
 	}
 
@@ -108,6 +109,7 @@ retry:
 	// Finalization failed - header changed. Check if key was inserted by another thread
 	// Keep our reserved slot and only unreserve if we find the key already exists
 retryWithSlot:
+	cpu.Yield() // back off before rescanning
 	h2 := atomicLoadHeader(&pb.Header)
 
 	if h2.getBinState() != BinNoTransfer {
