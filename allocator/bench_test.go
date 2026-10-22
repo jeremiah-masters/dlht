@@ -2,6 +2,7 @@ package allocator
 
 import (
 	"math/rand/v2"
+	"runtime"
 	"sync/atomic"
 	"testing"
 )
@@ -135,9 +136,14 @@ func BenchmarkInsertDeleteContended(b *testing.B) {
 	})
 }
 
-// sameBinMap returns an empty map and 12 keys that share one of its bins.
+// sameBinWorkers caps the SameBin goroutines. Each holds at most one slot at
+// a time, so this leaves 3 of the bin's 15 slots free.
+const sameBinWorkers = 12
+
+// sameBinMap returns an empty map and sameBinWorkers keys that share one of
+// its bins.
 func sameBinMap(b *testing.B) (*Map[uint64, uint64], []uint64) {
-	keys := keysForBin(testSeed, 63, 0, 12, 1<<24)
+	keys := keysForBin(testSeed, 63, 0, sameBinWorkers, 1<<24)
 	if keys == nil {
 		b.Skip("could not synthesize colliding keys")
 	}
@@ -147,11 +153,27 @@ func sameBinMap(b *testing.B) (*Map[uint64, uint64], []uint64) {
 // runSameBin gives each goroutine its own key in one bin, so the header CASes
 // of different keys collide.
 func runSameBin(b *testing.B, op func(m *Map[uint64, uint64], k uint64)) {
+	// At the default parallelism, RunParallel starts one goroutine per P.
+	// Go can't skip just one value of a -cpu list, so run larger values
+	// separately.
+	if procs := runtime.GOMAXPROCS(0); procs > sameBinWorkers {
+		b.Skipf("%d goroutines need a key each, but a bin holds %d with headroom", procs, sameBinWorkers)
+	}
 	m, keys := sameBinMap(b)
 	idx := m.getActiveIndex()
+	// Attach all three of the bin's link buckets before timing: concurrent
+	// attaches each take a link from the index's 8 before one wins, so a
+	// racing start can run out and resize. Delete leaves links attached.
+	for _, k := range keys {
+		m.Insert(k, k)
+	}
+	for _, k := range keys {
+		m.Delete(k)
+	}
 	var id atomic.Int32
+	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		k := keys[int(id.Add(1)-1)%len(keys)]
+		k := keys[id.Add(1)-1]
 		for pb.Next() {
 			op(m, k)
 		}
