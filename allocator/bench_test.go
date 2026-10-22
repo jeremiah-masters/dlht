@@ -2,10 +2,13 @@ package allocator
 
 import (
 	"math/rand/v2"
+	"sync/atomic"
 	"testing"
 )
 
 // Single-threaded benchmarks complement the contention suite in benchmarks/.
+// The Contended and SameBin benchmarks run on every P and time the CAS retry
+// paths; vary the contention with -cpu.
 
 const benchKeyspace = 1 << 16
 
@@ -107,4 +110,67 @@ func BenchmarkLoadOrComputeCompute(b *testing.B) {
 			b.Fatal("delete failed")
 		}
 	}
+}
+
+// BenchmarkPutContended updates one key from every goroutine.
+func BenchmarkPutContended(b *testing.B) {
+	m := New[uint64, uint64](Options{InitialSize: 64})
+	m.Insert(1, 0)
+	b.RunParallel(func(pb *testing.PB) {
+		for v := uint64(0); pb.Next(); v++ {
+			m.Put(1, v)
+		}
+	})
+}
+
+// BenchmarkInsertDeleteContended inserts and deletes one key from every
+// goroutine, so Deletes race each other for the same entry.
+func BenchmarkInsertDeleteContended(b *testing.B) {
+	m := New[uint64, uint64](Options{InitialSize: 64})
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			m.Insert(1, 1)
+			m.Delete(1)
+		}
+	})
+}
+
+// sameBinMap returns an empty map and 12 keys that share one of its bins.
+func sameBinMap(b *testing.B) (*Map[uint64, uint64], []uint64) {
+	keys := keysForBin(testSeed, 63, 0, 12, 1<<24)
+	if keys == nil {
+		b.Skip("could not synthesize colliding keys")
+	}
+	return newWithSeed[uint64, uint64](Options{InitialSize: 64}, testSeed), keys
+}
+
+// runSameBin gives each goroutine its own key in one bin, so the header CASes
+// of different keys collide.
+func runSameBin(b *testing.B, op func(m *Map[uint64, uint64], k uint64)) {
+	m, keys := sameBinMap(b)
+	idx := m.getActiveIndex()
+	var id atomic.Int32
+	b.RunParallel(func(pb *testing.PB) {
+		k := keys[int(id.Add(1)-1)%len(keys)]
+		for pb.Next() {
+			op(m, k)
+		}
+	})
+	if m.getActiveIndex() != idx {
+		b.Fatal("map resized; the keys no longer share a bin")
+	}
+}
+
+func BenchmarkInsertDeleteSameBin(b *testing.B) {
+	runSameBin(b, func(m *Map[uint64, uint64], k uint64) {
+		m.Insert(k, k)
+		m.Delete(k)
+	})
+}
+
+func BenchmarkLoadOrComputeSameBin(b *testing.B) {
+	runSameBin(b, func(m *Map[uint64, uint64], k uint64) {
+		m.LoadOrCompute(k, func() (uint64, bool) { return k, true })
+		m.Delete(k)
+	})
 }
