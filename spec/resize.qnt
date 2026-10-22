@@ -148,10 +148,9 @@ module resize {
     }
   }
 
-  // rsShadowCarry (design §4.3): SPEC-PRESCRIBED extension (Go's resize has
-  // no Shadow today; this is the carry-forward contract's normative home).
-  // No sentinel: Put/Delete never target Shadow slots. Ghost placeholder val
-  // + fresh tag carried per the spec's Shadow convention.
+  // rsShadowCarry (design §4.3) models carryShadowSlots in allocator/resize.go.
+  // Go copies only the hash and leaves the entry nil; val and tag are ghosts.
+  // No sentinel: Put/Delete never target Shadow slots.
   action rsShadowCarry = {
     nondet b = binDomain.oneOf()
     val snap = match snapshot.get(b) { | Some(sn) => sn | None => emptyHeader }

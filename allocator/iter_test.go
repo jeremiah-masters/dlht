@@ -154,6 +154,28 @@ func TestRange_FullyChainedBucket(t *testing.T) {
 	}
 }
 
+// With every slot full, all four bucket masks look alike, so a mask read from
+// the wrong bucket goes unnoticed. Deleting one slot at a time breaks that.
+func TestRange_FullyChainedBucketWithHole(t *testing.T) {
+	const bins = 32 // see TestRange_FullyChainedBucket
+	keys := keysForBin(testSeed, bins-1, 0, MAX_SLOTS_PER_BIN, 50_000_000)
+	if keys == nil {
+		t.Fatal("could not find 15 keys hashing to bin 0")
+	}
+	for hole := range keys {
+		m := newWithSeed[uint64, uint64](Options{InitialSize: bins}, testSeed)
+		insertKeys(t, m, keys) // keys[i] lands in slot i
+		if _, ok := m.Delete(keys[hole]); !ok {
+			t.Fatalf("Delete(keys[%d]) failed", hole)
+		}
+		want := expectMapKeys(keys)
+		delete(want, keys[hole])
+		if got := collectRange(t, m); !maps.Equal(got, want) {
+			t.Errorf("hole at slot %d: got %v, want %v", hole, got, want)
+		}
+	}
+}
+
 func TestRange_StopOnFalse(t *testing.T) {
 	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
 	insertSequential(t, m, 10)

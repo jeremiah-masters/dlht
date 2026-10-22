@@ -1,9 +1,9 @@
 // Package dlht provides DLHT, a high-performance lock-free hash table.
 //
-// DLHT is designed for high-concurrency scenarios and provides lock-free
-// operations for Get, Insert, Delete, and Put. It uses a sophisticated
-// memory ordering strategy and cooperative resizing to achieve excellent
-// performance under concurrent workloads.
+// DLHT provides linearizable Get, Insert, Delete, Put, and LoadOrCompute
+// operations with cooperative resizing. Get, Insert, Put, and Delete are
+// lock-free. LoadOrCompute runs a value function for an absent key; while it
+// runs, Insert and LoadOrCompute calls with the same 64-bit hash wait for it.
 //
 // Example usage:
 //
@@ -27,6 +27,11 @@
 //	// Delete keys
 //	if oldValue, deleted := m.Delete("key2"); deleted {
 //		fmt.Printf("Deleted key2 (old value: %d)\n", oldValue)
+//	}
+//
+//	// Compute and insert a value if the key is absent
+//	if value, loaded := m.LoadOrCompute("key3", func() (int, bool) { return 7, true }); !loaded {
+//		fmt.Printf("Computed key3 = %d\n", value)
 //	}
 package dlht
 

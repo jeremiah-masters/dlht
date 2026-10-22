@@ -1,10 +1,10 @@
 # DLHT
 
-DLHT is a high-performance, lock-free hash table for high-concurrency workloads based on DLHT: A Non-blocking Resizable Hashtable with Fast Deletes and Memory-awareness (<https://arxiv.org/abs/2406.09986>). It provides lock-free Get, Insert, Delete, and Put operations with sophisticated memory ordering and cooperative resizing.
+DLHT is a high-performance, lock-free hash table for high-concurrency workloads based on DLHT: A Non-blocking Resizable Hashtable with Fast Deletes and Memory-awareness (<https://arxiv.org/abs/2406.09986>). It provides Get, Insert, Delete, Put, and LoadOrCompute operations with cooperative resizing.
 
 ## Features
 
-- **Lock-free operations**: All operations (Get, Insert, Delete, Put) are lock-free and linearizable
+- **Lock-free operations**: Get, Insert, Delete, and Put are lock-free, and every operation is linearizable. The exception is LoadOrCompute: while its value function runs, Insert and LoadOrCompute calls with the same 64-bit hash wait for it
 - **High concurrency**: Scales well with multiple threads and cores
 - **Automatic resizing**: Cooperative resize algorithm that doesn't block operations
 - **Memory efficient**: Cache-line optimized data structures with bounded overflow
@@ -36,6 +36,11 @@ func main() {
     // Update values atomically
     if oldValue, updated := m.Put("apple", 10); updated {
         fmt.Printf("Updated apple: %d -> %d\n", oldValue, 10)
+    }
+
+    // Compute and insert a value if the key is absent
+    if value, loaded := m.LoadOrCompute("cherry", func() (int, bool) { return 8, true }); !loaded {
+        fmt.Printf("Computed cherry = %d\n", value)
     }
 
     // Delete keys
@@ -74,6 +79,7 @@ func main() {
 - `Get(key K) (V, bool)`: Get a value by key
 - `Insert(key K, value V) (V, bool)`: Insert a new key-value pair
 - `Put(key K, value V) (V, bool)`: Update an existing key atomically
+- `LoadOrCompute(key K, fn func() (V, bool)) (V, bool)`: Return the existing value with `loaded=true`, or call `fn` and return its value with `loaded=false`. The computed value is inserted if `fn` returns `save=true`
 - `Delete(key K) (V, bool)`: Delete a key and return the old value
 - `Size() uint64`: Approximate count of valid entries
 - `Stats() Stats`: Get current statistics
@@ -81,6 +87,10 @@ func main() {
 - `All() iter.Seq2[K, V]`: Range adapter for `for k, v := range m.All()`
 - `Keys() iter.Seq[K]`: Range over keys only
 - `Values() iter.Seq[V]`: Range over values only
+
+LoadOrCompute serializes computes for each 64-bit hash. Insert and LoadOrCompute callers of an absent key wait for a pending compute with that hash; Get, Put, Delete, and Range treat the pending key as absent. A `save=true` result is inserted before LoadOrCompute returns. Once inserted, a concurrent Put or Delete can change it before the call returns.
+
+Keep `fn` short and let it return normally. A panic or `runtime.Goexit` leaves its claim pending, so later Insert and LoadOrCompute calls with that hash can wait forever. Recover inside `fn` and return `save=false` to release the claim after a panic. Within `fn`, do not Insert or LoadOrCompute the same key or another key with the same hash, and avoid cyclic waits between callbacks.
 
 ## Implementation Details
 
@@ -93,7 +103,7 @@ This package provides a clean public API that wraps the allocator-based implemen
 
 DLHT is designed for high-performance concurrent workloads:
 
-- **Lock-free**: No blocking between operations
+- **Lock-free**: No blocking between operations, except Insert and LoadOrCompute calls waiting on a same-hash LoadOrCompute
 - **Cache-optimized**: 64-byte buckets fit exactly in cache lines
 - **Bounded overflow**: Maximum 15 slots per bucket for predictable performance
 - **Cooperative resizing**: Non-blocking resize with work-stealing
@@ -114,4 +124,4 @@ Panels cover read-only reads, insert/delete churn, a put-heavy mix, and rapid gr
 
 ## License
 
-Licensed under Apache v2.
+Apache 2.0. See [LICENSE](LICENSE).

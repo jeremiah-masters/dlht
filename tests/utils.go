@@ -20,6 +20,9 @@ const (
 	OpInsert
 	OpPut
 	OpDelete
+	OpLoadOrCompute       // fn returns (Value, save=true)
+	OpLoadOrComputeNoSave // fn returns (Value, save=false)
+	OpLoadOrComputeSlow   // like OpLoadOrCompute, but fn yields first so the claim stays open across concurrent activity
 )
 
 type DLHTInput struct {
@@ -29,9 +32,10 @@ type DLHTInput struct {
 }
 
 type DLHTOutput struct {
-	Found   bool
-	Value   int
-	Updated bool
+	Found    bool
+	Value    int
+	Updated  bool
+	Computed bool // LoadOrCompute only: fn ran (exactly once)
 }
 
 func (input DLHTInput) String() string {
@@ -44,6 +48,12 @@ func (input DLHTInput) String() string {
 		return fmt.Sprintf("Put(%s, %d)", input.Key, input.Value)
 	case OpDelete:
 		return fmt.Sprintf("Delete(%s)", input.Key)
+	case OpLoadOrCompute:
+		return fmt.Sprintf("LoadOrCompute(%s, fn->%d save)", input.Key, input.Value)
+	case OpLoadOrComputeNoSave:
+		return fmt.Sprintf("LoadOrCompute(%s, fn->%d nosave)", input.Key, input.Value)
+	case OpLoadOrComputeSlow:
+		return fmt.Sprintf("LoadOrCompute(%s, slow fn->%d save)", input.Key, input.Value)
 	default:
 		return fmt.Sprintf("Unknown(%d)", input.Op)
 	}
@@ -51,7 +61,7 @@ func (input DLHTInput) String() string {
 
 // String returns a string representation of the output for debugging
 func (output DLHTOutput) String() string {
-	return fmt.Sprintf("{Found: %t, Value: %d, Updated: %t}", output.Found, output.Value, output.Updated)
+	return fmt.Sprintf("{Found: %t, Value: %d, Updated: %t, Computed: %t}", output.Found, output.Value, output.Updated, output.Computed)
 }
 
 // PerKeyState is the state of a single key in the Porcupine model.
@@ -102,6 +112,21 @@ var DLHTModel = porcupine.Model{
 				return false, st
 			}
 			return !out.Found && out.Value == 0, st
+		case OpLoadOrCompute, OpLoadOrComputeNoSave, OpLoadOrComputeSlow:
+			if st.Exists {
+				// Present: loaded, fn did not run.
+				return out.Found && out.Value == st.Value && !out.Computed, st
+			}
+			// Absent: fn ran exactly once and its value is returned; with
+			// save=true it is now the key's value, with save=false the key
+			// stays absent.
+			if out.Found || !out.Computed || out.Value != inp.Value {
+				return false, st
+			}
+			if inp.Op == OpLoadOrComputeNoSave {
+				return true, st
+			}
+			return true, PerKeyState{Exists: true, Value: inp.Value}
 		default:
 			return false, st
 		}
@@ -137,6 +162,14 @@ var DLHTModel = porcupine.Model{
 				return fmt.Sprintf("Delete(%s) -> deleted (was %d)", inp.Key, out.Value)
 			}
 			return fmt.Sprintf("Delete(%s) -> not found", inp.Key)
+		case OpLoadOrCompute, OpLoadOrComputeNoSave, OpLoadOrComputeSlow:
+			if out.Found {
+				return fmt.Sprintf("%s -> loaded %d", inp, out.Value)
+			}
+			if out.Computed {
+				return fmt.Sprintf("%s -> computed %d", inp, out.Value)
+			}
+			return fmt.Sprintf("%s -> %d (fn did not run?)", inp, out.Value)
 		default:
 			return "Unknown operation"
 		}
@@ -202,6 +235,20 @@ func ExecuteOperation(m *dlht.Map[string, int], input DLHTInput) DLHTOutput {
 	case OpDelete:
 		deletedValue, deleted := m.Delete(input.Key)
 		return DLHTOutput{Found: deleted, Value: deletedValue, Updated: false}
+	case OpLoadOrCompute, OpLoadOrComputeNoSave, OpLoadOrComputeSlow:
+		save := input.Op != OpLoadOrComputeNoSave
+		calls := 0
+		value, loaded := m.LoadOrCompute(input.Key, func() (int, bool) {
+			calls++
+			if input.Op == OpLoadOrComputeSlow {
+				runtime.Gosched()
+			}
+			return input.Value, save
+		})
+		if calls > 1 {
+			panic(fmt.Sprintf("LoadOrCompute(%s) called fn %d times", input.Key, calls))
+		}
+		return DLHTOutput{Found: loaded, Value: value, Computed: calls == 1}
 	default:
 		return DLHTOutput{Found: false, Value: 0, Updated: false}
 	}
@@ -241,6 +288,12 @@ func selectOperation(distribution []float64, key string, value int) DLHTInput {
 				return DLHTInput{OpPut, key, value}
 			case 3:
 				return DLHTInput{OpDelete, key, 0}
+			case 4:
+				return DLHTInput{OpLoadOrCompute, key, value}
+			case 5:
+				return DLHTInput{OpLoadOrComputeNoSave, key, value}
+			case 6:
+				return DLHTInput{OpLoadOrComputeSlow, key, value}
 			}
 		}
 	}

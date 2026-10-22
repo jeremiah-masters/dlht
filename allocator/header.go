@@ -6,20 +6,16 @@ import (
 )
 
 const (
-	versionShift   = 32
-	binStateShift  = 30
-	binStateMask   = 0x3 << binStateShift
-	slotStatesMask = (1 << 30) - 1
+	versionShift  = 32
+	binStateShift = 30
+	binStateMask  = 0x3 << binStateShift
 )
 
-func (h Header) getBinState() uint8 { return uint8((uint64(h) & binStateMask) >> binStateShift) }
-
-func (h Header) getSlotStates() uint32 { return uint32(uint64(h) & slotStatesMask) }
+func (h Header) getBinState() uint8 { return uint8(uint32(h) >> binStateShift) }
 
 func (h Header) getSlotState(slotIdx int) uint8 {
-	s := h.getSlotStates()
-	shift := uint(slotIdx*2) & 63 // prove to compiler shift < 64; elided on both arm64 and amd64
-	return uint8((s >> shift) & 0x3)
+	shift := uint(slotIdx*2) & 63 // slot indices 0..14; bound the shift for the compiler
+	return uint8((uint64(h) >> shift) & 0x3)
 }
 
 func (h Header) setBinState(binState uint8) Header {
@@ -57,30 +53,59 @@ func atomicStoreSlotVal[K Key, V any](slot *Slot[K, V], entry *Entry[K, V]) {
 	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&slot.Val)), unsafe.Pointer(entry))
 }
 
-// validMask3 returns a spread bitmask indicating which of the first 3 slots are valid (state == 2).
+// validMask3 returns a spread bitmask indicating which of the first 3 slots are valid (state == 0b11).
 // Bits are at positions 0, 2, 4 (not compacted to 0, 1, 2). Use bits.TrailingZeros32(mask) >> 1
 // to convert to a slot index.
 //
-// Invariant: slot state 3 (0b11) never occurs in the protocol, so the high bit
-// of each 2-bit state field alone identifies Valid (state 2 = 0b10).
+// Both bits must be set: Shadow slots can hold an entry before it is published.
 func (h Header) validMask3() uint32 {
-	return (uint32(h) >> 1) & 0x15
+	s := uint32(h)
+	return (s & (s >> 1)) & 0x15
 }
 
 // validMask4 returns a spread bitmask indicating which of 4 slots starting at base are valid.
 // Bits are at positions 0, 2, 4, 6 (not compacted to 0, 1, 2, 3). Use bits.TrailingZeros32(mask) >> 1
 // to convert to a slot index relative to base.
 //
-// Invariant: slot state 3 (0b11) never occurs in the protocol.
+// Both bits must be set, as in validMask3.
 func (h Header) validMask4(base uint) uint32 {
-	return (uint32(h) >> ((base << 1) + 1)) & 0x55
+	s := uint32(h) >> (base << 1)
+	return (s & (s >> 1)) & 0x55
+}
+
+// validMaskAll returns the Valid slots across the bin, at bits 0, 2, ..., 28.
+// The mask excludes the bin-state bits.
+func (h Header) validMaskAll() uint32 {
+	s := uint32(h)
+	return (s & (s >> 1)) & 0x15555555
+}
+
+// shadowMask3 returns a spread bitmask (bits 0, 2, 4) of the first 3 slots in
+// Shadow state (0b10): high bit set, low bit clear.
+func (h Header) shadowMask3() uint32 {
+	s := uint32(h)
+	return ((s >> 1) &^ s) & 0x15
+}
+
+// shadowMask4 returns a spread bitmask (bits 0, 2, 4, 6) of the 4 slots
+// starting at base that are in Shadow state (0b10).
+func (h Header) shadowMask4(base uint) uint32 {
+	s := uint32(h) >> (base << 1)
+	return ((s >> 1) &^ s) & 0x55
+}
+
+// shadowMaskAll returns the Shadow slots across the bin, at bits 0, 2, ..., 28.
+// The mask excludes the bin-state bits.
+func (h Header) shadowMaskAll() uint32 {
+	s := uint32(h)
+	return ((s >> 1) &^ s) & 0x15555555
 }
 
 // invalidMask3 returns a spread bitmask indicating which of the first 3 slots are invalid (state == 0).
 // Bits are at positions 0, 2, 4 (not compacted to 0, 1, 2). Use bits.TrailingZeros32(mask) >> 1
 // to convert to a slot index.
 func (h Header) invalidMask3() uint32 {
-	s := uint32(h) & 0x3F
+	s := uint32(h)
 	return ^(s | (s >> 1)) & 0x15
 }
 
@@ -88,7 +113,7 @@ func (h Header) invalidMask3() uint32 {
 // Bits are at positions 0, 2, 4, 6 (not compacted). Use bits.TrailingZeros32(mask) >> 1
 // to convert to a slot index relative to base.
 func (h Header) invalidMask4(base uint) uint32 {
-	s := (uint32(h) >> (base << 1)) & 0xFF
+	s := uint32(h) >> (base << 1)
 	return ^(s | (s >> 1)) & 0x55
 }
 

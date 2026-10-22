@@ -60,6 +60,40 @@ func Example() {
 	// Map has 64 bins with load factor 0.002
 }
 
+// ExampleMap_LoadOrCompute computes a value only when the key is absent.
+func ExampleMap_LoadOrCompute() {
+	m := dlht.New[string, int](dlht.Options{InitialSize: 64})
+
+	calls := 0
+	expensive := func() (int, bool) {
+		calls++
+		return 42, true // save the computed value
+	}
+
+	// Compute and insert the missing value.
+	if v, loaded := m.LoadOrCompute("answer", expensive); !loaded {
+		fmt.Printf("computed: %d\n", v)
+	}
+
+	// Load the existing value without calling expensive.
+	if v, loaded := m.LoadOrCompute("answer", expensive); loaded {
+		fmt.Printf("loaded: %d\n", v)
+	}
+
+	fmt.Printf("fn calls: %d\n", calls)
+
+	// A save=false return computes without inserting.
+	v, _ := m.LoadOrCompute("probe", func() (int, bool) { return 7, false })
+	_, found := m.Get("probe")
+	fmt.Printf("probe computed %d, stored: %v\n", v, found)
+
+	// Output:
+	// computed: 42
+	// loaded: 42
+	// fn calls: 1
+	// probe computed 7, stored: false
+}
+
 // Example_concurrent demonstrates concurrent usage of DLHT
 func Example_concurrent() {
 	m := dlht.New[uint64, string](dlht.Options{InitialSize: 32})

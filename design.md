@@ -6,6 +6,8 @@ DLHT implements a lock-free concurrent hash table based on the DLHT algorithm fr
 
 The fundamental challenge of concurrent hash tables is allowing multiple threads to read and write simultaneously without corrupting data or losing updates. Traditional approaches use locks, which serialize access and limit scalability. DLHT instead uses atomic operations and careful memory ordering to achieve lock-freedom: no thread holds a lock that could block others, so the system as a whole always makes progress—even though an individual operation may retry under contention while other threads succeed.
 
+There are two exceptions. During a resize, an operation on a bin that another thread is copying waits for the copy to finish, and an insertion into a full bin waits for the resize to complete (see "Growing: Cooperative Resize"). And while a LoadOrCompute value function runs, Insert and LoadOrCompute calls with the same 64-bit hash wait for it to return (see "Computing: LoadOrCompute and the Shadow Claim").
+
 ---
 
 ## The Core Insight: Separating Visibility from Data
@@ -126,7 +128,7 @@ This allows readers to proceed without taking locks while guaranteeing they neve
 
 The 2-bit bin state tracks resize progress. A bin starts in NoTransfer (00), transitions to InTransfer (01) when being moved, and ends at DoneTransfer (10) when migration completes. Operations check this state and redirect to the new index when necessary.
 
-The remaining 30 bits encode states for up to 15 slots (2 bits each). Each slot can be Invalid (00), Trying (01), or Valid (10). Only Valid slots are visible to readers. The Trying state is crucial for insert atomicity—it marks a slot as "claimed but not yet published."
+The remaining 30 bits encode states for up to 15 slots (2 bits each). Each slot can be Invalid (00), Trying (01), Shadow (10), or Valid (11). Only Valid slots are visible to readers. Trying reserves a slot for insertion. Shadow reserves a hash for LoadOrCompute: Insert and LoadOrCompute wait for a pending claim with the same hash (see "Computing: LoadOrCompute and the Shadow Claim").
 
 ### Slots and Entries: The Two-Level Structure
 
@@ -243,14 +245,21 @@ stateDiagram-v2
     Trying: Reserved by inserter
     Trying: Invisible to readers
 
-    Valid: Valid (10)
+    Valid: Valid (11)
     Valid: Contains live entry
     Valid: Visible to readers
 
+    Shadow: Shadow (10)
+    Shadow: LoadOrCompute claim, fn running
+    Shadow: Invisible to readers, blocks same-hash inserters
+
     Invalid --> Trying: reserveSlot CAS\n(slot 00→01, ver++)
-    Trying --> Valid: finalizeSlot CAS\n(slot 01→10, ver++)
+    Trying --> Valid: finalizeSlot CAS\n(slot 01→11, ver++)
     Trying --> Invalid: unreserveSlot CAS\n(only if BinNoTransfer)
-    Valid --> Invalid: markSlotInvalid AND\n(slot 10→00, no ver bump)
+    Trying --> Shadow: publish CAS\n(slot 01→10, ver++)
+    Shadow --> Valid: commit CAS\n(slot 10→11, ver++, save=true)
+    Shadow --> Invalid: abort CAS\n(slot 10→00, ver++, save=false)
+    Valid --> Invalid: markSlotInvalid AND\n(slot 11→00, no ver bump)
 ```
 
 **Invalid → Trying**: An inserting thread claims a slot by atomically transitioning it from Invalid to Trying. This CAS compares the entire 64-bit header, so it fails if any other thread modified anything in the bucket. The Trying state is invisible to readers (not included in validity masks) but blocks other inserters from claiming the same slot.
@@ -259,11 +268,17 @@ stateDiagram-v2
 
 **Trying → Invalid**: If an insert needs to abort (found a duplicate key, resize started), it can unreserve the slot. This only succeeds if the bin is still in normal operation—once transfer starts, the slot belongs to the transfer process.
 
+**Trying → Shadow**: LoadOrCompute publishes its claim after writing the hash. The entry pointer remains nil. The CAS uses the post-reserve header; if it fails, LoadOrCompute releases the slot and starts over. Insert and LoadOrCompute wait for claims with the same hash; readers ignore them. The value function runs while the slot is Shadow.
+
+**Shadow → Valid**: The holder release-stores the computed entry, then commits with a CAS from Shadow to Valid. The entry becomes visible at this CAS. Before it, readers exclude Shadow slots and no DWCAS can match the fresh entry pointer.
+
+**Shadow → Invalid**: If the value function returns `save=false`, a CAS releases the claim and increments the version. No entry was stored, so no pointer cleanup is needed.
+
 **Valid → Invalid**: After Delete's DWCAS clears the entry pointer, a best-effort `markSlotInvalid` transitions the slot from Valid to Invalid. Between the DWCAS and this cleanup, the slot is in a transient state (Valid in header, nil entry pointer). Readers skip it because they check `entry != nil`. The cleanup makes the slot available for reuse by Insert.
 
 Unlike the other transitions, `markSlotInvalid` uses `atomic.AndUint64` to clear the slot's two state bits unconditionally, with no CAS loop and no version bump. This is safe because:
 
-- Readers still detect the change: the bit transition `10 → 00` makes the post-read header differ from the pre-read header, so the seqlock check retries.
+- Readers still detect the change: the bit transition `11 → 00` makes the post-read header differ from the pre-read header, so the seqlock check retries.
 - ABA is impossible: any subsequent Insert re-using this slot performs a reserve CAS that *does* bump the version, so a reader cannot be fooled into accepting a stale snapshot by a coincidence of bit patterns.
 - No precondition check is needed: the slot must be Valid (the DWCAS just succeeded), the entry pointer must be nil (the DWCAS set it), and resize only cares about entry pointers, not slot states.
 
@@ -305,17 +320,18 @@ If bin state is DoneTransfer, we follow `idx.indexNext` to the successor index a
 
 **Step 2: Extract the validity mask and scan slots.**
 
-The `validMask3()` function extracts which of the 3 primary slots are Valid using bit manipulation. It exploits a protocol invariant: slot state `0b11` never occurs—slots only transition through `00` (Invalid), `01` (Trying), and `10` (Valid). With `0b11` ruled out, the high bit of each 2-bit state field *alone* identifies Valid (state `10`):
+The `validMask3()` function identifies Valid slots among the 3 primary slots. It checks both bits of each state: Valid (`11`) shares its high bit with Shadow (`10`), which must stay invisible to readers.
 
 ```go
 func (h Header) validMask3() uint32 {
-    return (uint32(h) >> 1) & 0x15
+    s := uint32(h)
+    return (s & (s >> 1)) & 0x15
 }
 ```
 
 `0x15` is `0b010101`—bits at positions 0, 2, and 4. The result is a *spread bitmap*: bit `i*2` is set iff slot `i` is Valid. Callers recover the slot index with `bits.TrailingZeros32(mask) >> 1`, and clear the lowest-set bit via `mask &= mask - 1` to advance to the next match. Keeping the spread form lets us `AND` it directly with a parallel "hash matches" spread bitmap during key lookup without any shuffling.
 
-A companion `validMask4(base)` does the same for a 4-slot link bucket starting at the given bit offset (6, 14, or 22 in the header), and `invalidMask3`/`invalidMask4` produce the complementary "which slots are Invalid" bitmaps used by the insert path to pick a free slot.
+A companion `validMask4(base)` handles a 4-slot link bucket. Its base is the slot index (3, 7, or 11), corresponding to header bit offsets 6, 14, and 22. `invalidMask3`/`invalidMask4` match Invalid (`00`) slots for insertion. `shadowMask3`/`shadowMask4`/`shadowMaskAll` match Shadow (`10`) slots for claim scans and resize.
 
 This branchless bit manipulation is faster than separate comparisons. The fast path checks primary slots first; only if the key isn't found do we check link buckets.
 
@@ -660,10 +676,10 @@ func (m *Map[K, V]) markSlotInvalid(pb *PrimaryBucket[K, V], slotIdx int) {
 │(32b)|   (2b)   |   (30b)    │    (32b)    │  (32b)    │(64b)| (64b) │(64b)| (64b) │(64b)| (64b) │
 ├─────┼──────────┼────────────┼─────────────┼───────────┼─────┼───────┼─────┼───────┼─────┼───────┤
 │ 44  │    00    │  S2 S1 S0  │      00     │     00    │ K3  │  V3   │ K1  │ nil   │ K2  │  V2   │
-│     │NoTransfer│  10 00 10  │   NO_LINK   │  NO_LINK  │     │       │     │       │     │       │
+│     │NoTransfer│  11 00 11  │   NO_LINK   │  NO_LINK  │     │       │     │       │     │       │
 └─────┴──────────┴────────────┴─────────────┴───────────┴─────┴───────┴─────┴───────┴─────┴───────┘
                      ▲
-           Changed: 10 → 00 (Valid → Invalid)
+           Changed: 11 → 00 (Valid → Invalid)
            Version: 44 → 44 (unchanged — AND does not bump version)
 ```
 
@@ -671,10 +687,30 @@ This cleanup transitions the slot from Valid to Invalid in the header, making it
 
 - The slot's state bits are Valid (our DWCAS just succeeded against them).
 - The entry pointer is nil (our DWCAS set it).
-- No concurrent Insert can have recycled the slot: reserve CAS only fires against Invalid slots, and the state bits are still Valid until this AND runs. So the state bits we're about to clear are exactly `10`, as expected.
+- No concurrent Insert can have recycled the slot: reserve CAS only fires against Invalid slots, and the state bits are still Valid until this AND runs. So the state bits we're about to clear are exactly `11`, as expected.
 - Resize reads entry *pointers* to decide what to transfer, not slot states, so if a concurrent resize set `BinInTransfer` between our DWCAS and this AND it's harmless: the transfer will see a nil pointer and skip the slot regardless of what the state bits say.
 
-The AND doesn't bump the version, but correctness doesn't require it to: the *bit pattern* of the header changes (state `10 → 00`), so any seqlock reader that loaded the header before the AND and re-loads after will observe a different 64-bit value and retry. ABA is impossible because the next operation to modify this slot—an Insert's reserve CAS—does bump the version, so a reader cannot be fooled by a coincidence of bit patterns.
+The AND doesn't bump the version, but correctness doesn't require it to: the *bit pattern* of the header changes (state `11 → 00`), so any seqlock reader that loaded the header before the AND and re-loads after will observe a different 64-bit value and retry. ABA is impossible because the next operation to modify this slot—an Insert's reserve CAS—does bump the version, so a reader cannot be fooled by a coincidence of bit patterns.
+
+---
+
+## Computing: LoadOrCompute and the Shadow Claim
+
+`LoadOrCompute(key, fn)` returns an existing value without calling `fn`. Otherwise it claims the key, calls `fn` once, and inserts the result if `save=true`. Callbacks for the same key cannot overlap, and a computed value cannot lose an insertion race. An overlapping Put or Delete can still replace or remove the value after it is inserted.
+
+Claims use the **Shadow (0b10)** slot state. `spec/protocol.qnt` models the protocol in LC1–LC10, with `contractAtMostOneComputePerKey` and `contractHolderExclusive` expressing the callback guarantees. The model's scope and differences from Go, including Insert's finalize retry, are documented in `spec/README.md`.
+
+1. **Scan** under the seqlock header. Return a matching entry, or wait and rescan if a Shadow slot holds the hash.
+2. **Reserve** an Invalid slot as Trying and write the hash.
+3. **Publish** Trying→Shadow with a CAS against the post-reserve header. If it fails, release the reservation and restart from the scan, as the model does (LC5 → LC8 → LC1). The entry pointer remains nil while `fn` runs.
+4. **Run `fn`** once under the claim.
+5. **Resolve** by release-storing the computed entry and CASing Shadow→Valid for `save=true`, or CASing Shadow→Invalid for `save=false`.
+
+Insert checks for same-hash Shadow claims in both its initial scan and its retry scan. The claim contains only a hash, so different keys with the same 64-bit hash also serialize. Get, Put, Delete, and Range exclude Shadow slots and see the pending key as absent. Trying cannot serve this purpose: inserters ignore other Trying slots, and resize may leave Trying reservations behind in the old index.
+
+The callback must return normally. A panic or `runtime.Goexit` leaves the claim pending: the key remains absent, and later Insert or LoadOrCompute calls with that hash can wait forever. A callback that may panic can recover internally and return `save=false`. It must not Insert or LoadOrCompute its own key or another key with the same hash, or form a cycle of waits with another callback. Operations on other hashes, including those that trigger resize, are supported.
+
+Resize copies each claim's hash into a Shadow slot in the successor index, with a nil entry and no sentinel. The holder waits while its bin is `InTransfer`; it must not restart or resolve against an `InTransfer` header. Once the bin is `DoneTransfer`, it follows the successor and finds the carried claim by hash. It repeats this across further resizes, storing its computed entry again before committing in the current bin.
 
 ---
 
@@ -743,7 +779,7 @@ ctx.chunkClaimed  ──▶  (atomic FAA +1 per claim)
 
 Each claimed chunk is transferred (`transferChunk` re-hashes its 1024 old bins into the new index), after which the thread performs a second FAA on `ctx.chunksDone`. The thread whose FAA brings `chunksDone` to `k` is the finalizer: it updates `newIdx.linkCapacity` to reflect the unused link budget, stores `newIdx` into `m.active`, flips the context's `active` back to `ResizeInactive`, clears `resizeCtx`, and releases its references to the old and new indexes so the old index becomes garbage-collectable.
 
-This work-stealing pattern ensures no thread can block progress. If Thread A stalls mid-chunk, Threads B and C continue with other chunks. Eventually, someone will complete Thread A's chunk (or Thread A will resume).
+Work-stealing spreads the transfer across threads, but a chunk belongs to the thread that claimed it. If Thread A stalls mid-chunk, Threads B and C continue with other chunks, and operations on bins A has not reached yet keep using the old index. Two things wait for A to resume: operations on the bin A is copying, and the switch to the new index, which insertions into full bins are waiting for.
 
 ### Helping During Resize
 
@@ -761,7 +797,7 @@ for {
 }
 ```
 
-Inserts call `helpResize` immediately after triggering (so the triggering thread itself participates), and operations that encounter `BinInTransfer` effectively help by contending on the same chunk counter. The `ResizeReserved` state handles the narrow window between the placeholder CAS and the real context being published—helpers yield rather than busy-looping on unpopulated metadata.
+Inserts call `helpResize` immediately after triggering (so the triggering thread itself participates). Operations that encounter `BinInTransfer` don't help; they back off and retry (see "Operation Behavior During Resize"). The `ResizeReserved` state handles the narrow window between the placeholder CAS and the real context being published—helpers yield rather than busy-looping on unpopulated metadata.
 
 ### Transferring a Bin
 
@@ -793,6 +829,12 @@ func (m *Map[K, V]) transferBin(ctx *resizeContext[K, V], binIndex uint64) {
             ctx.oldIndex.getLinkBucket(p+1).slotAt(0), sentinel)
     }
 
+    // Carry the snapshot's LoadOrCompute claims by hash.
+    if h.shadowMaskAll() != 0 {
+        m.carryShadowSlots(ctx, h.shadowMask3(), oldBin.slotAt(0))
+        // ... and the same walk over the attached link buckets
+    }
+
     // Mark transfer complete; this store releases all writes into the new index
     finalHeader := h.setBinState(BinDoneTransfer)
     atomic.StoreUint64((*uint64)(&oldBin.Header), uint64(finalHeader))
@@ -802,6 +844,8 @@ func (m *Map[K, V]) transferBin(ctx *resizeContext[K, V], binIndex uint64) {
 The key insight is that `atomic.OrUint64` (added in Go 1.23) returns the value *before* the OR operation. This gives us a consistent snapshot of which slots were Valid at the moment we claimed the bin, and simultaneously acts as an acquire-release fence: no further Insert can finalize a slot in this bin (its finalize CAS will fail, because the bin-state bits have changed), and no Delete can invalidate a slot after this point (its inner seqlock check detects the header change).
 
 We iterate using *the snapshot's* `validMask3` / `validMask4`, not the live header. Slots that were Trying when we took the snapshot are skipped—those inserts will fail their finalize and retry on the new index. Slots that were Valid are transferred. A slot that was Valid in the snapshot may have been concurrently cleared by a Delete's DWCAS (entry pointer set to nil); `transferValidSlots` detects this nil and skips the slot—the key has already been logically removed.
+
+`carryShadowSlots` walks the snapshot's Shadow masks and copies each claim's hash into a fresh Shadow slot in the new index. Its entry stays nil, and no sentinel is needed because Put/Delete cannot target the claim. A holder can resolve only against a `NoTransfer` header, so these claims remain pending throughout transfer. The holder follows its carried claim after observing `BinDoneTransfer`.
 
 ### Writing Into the New Index
 
@@ -845,7 +889,7 @@ Operations encountering a bin mid-transfer behave according to bin state:
 
 **BinNoTransfer (00):** Normal operation. Proceed as usual.
 
-**BinInTransfer (01):** The bin is being transferred. The operation backs off politely and retries from the top: first `cpu.Yield()` (a cheap PAUSE / YIELD spin hint), then a re-check of the bin state; if still `BinInTransfer`, escalate to `runtime.Gosched()` to give the scheduler a chance to run the transferring goroutine. Either way, reload `m.active` and retry—by the time the operation runs again the bin is typically already `BinDoneTransfer`, or the resize is done and the operation finds itself on the new index.
+**BinInTransfer (01):** The bin is being transferred. The operation backs off politely and retries from the top: first `cpu.Yield()` (a cheap PAUSE / YIELD spin hint), then a re-check of the bin state; if still `BinInTransfer`, escalate to `runtime.Gosched()` to give the scheduler a chance to run the transferring goroutine. Either way, reload `m.active` and retry—by the time the operation runs again the bin is typically already `BinDoneTransfer`, or the resize is done and the operation finds itself on the new index. If the transferring goroutine is descheduled mid-bin, operations on that bin keep backing off until it runs again; a bin holds at most 15 entries, so the copy itself is short.
 
 **BinDoneTransfer (10):** Transfer complete for this bin. All operations must redirect to the new index. They follow `idx.indexNext` to the next generation (*not* `m.active`—see "Initiating Resize" above for why multi-generation laggards must walk the chain) and retry there.
 
@@ -958,6 +1002,8 @@ A concurrent data structure is linearizable if every operation appears to take e
 
 **Put** linearizes at the successful DWCAS. The old value existed until this instant; the new value exists after. The DWCAS atomically verifies the entry is still present (key matches) and updates the value.
 
+**LoadOrCompute** linearizes like Get when it returns an existing value. When it calls `fn`, it linearizes at the resolve CAS: Shadow→Valid makes a `save=true` result visible; Shadow→Invalid releases a `save=false` claim while the key is still absent. Put and Delete see the key as absent before the commit and may update or remove it afterwards.
+
 Each operation has exactly one linearization point—a single atomic instruction where the operation "takes effect." All other work (scanning, retrying, cleanup) happens around this point but doesn't affect linearizability.
 
 ---
@@ -1004,8 +1050,8 @@ DLHT achieves high-performance concurrent hash table operations through several 
 
 **DWCAS** provides the linearization point for both Put and Delete, atomically reading the old value while writing the new one (or nil). The 128-bit atomic operation is the key to both safe in-place updates and returning correct previous values.
 
-**Cooperative resize** distributes work among threads via atomic work-stealing. No single thread can block progress.
+**Cooperative resize** distributes work among threads via atomic work-stealing. A stalled thread holds up only the bin it is copying and the final switch to the new index.
 
 **Strategic memory ordering** uses plain loads where safe and atomics where necessary. The result is both correct and fast.
 
-The design prioritizes read performance (the most common operation) while maintaining linearizability under arbitrary concurrency. The bounded overflow ensures predictable worst-case performance, and the cooperative resize ensures the table can grow without blocking operations.
+The design prioritizes read performance (the most common operation) while maintaining linearizability under arbitrary concurrency. The bounded overflow ensures predictable worst-case performance, and the cooperative resize lets the table grow while operations continue; only operations on a bin being copied, and insertions into full bins, wait for it.

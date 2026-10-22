@@ -22,7 +22,7 @@ work-stealing machinery): `rsTrigger` (allocate + indexNext publish),
 `rsSentinel` (its own atomic step — the per-slot StoreLoad cut against
 Put/Delete DWCAS), `rsMove` (fused read+place into the child; skips
 concurrently-deleted entries), `rsShadowCarry` (the LoadOrCompute claim
-carry — a spec-prescribed contract; today's Go resize has no Shadow),
+carry — implemented in Go by `allocator/resize.go`'s `carryShadowSlots`),
 `rsDone` (a snapshot **overwrite**, discarding transfer-window D8 ANDs;
 sentinels persist in dead-bin slot keys forever), and `rsFinalize`
 (`m.active` advances). `system.qnt` composes `systemStep = protocol step ∨
@@ -175,18 +175,15 @@ stage-1a evidence tier is described below.
   theorem (`rsDone` is an abstract no-op). The Phase 0 inductive +
   anchored-refinement results continue to hold on the maxGen=0 configs
   (re-verified; `rsInvPure` additions are inert there by `genTopology`).
-- **Insert's keep-slot retry path**: on finalize failure, the Go implementation
-  (`allocator/insert.go:102–153`, `retryWithSlot`) KEEPS its `Trying`
-  reservation, re-scans under a fresh header `h2`, and re-finalizes with `h2`
-  as the CAS expectation; the spec models unreserve-and-restart (I6 → I1)
-  instead. This is a sound coarsening for linearizability — every keep-slot
-  outcome maps to an unreserve+retry execution with identical abstract
-  behavior — but the re-finalize-under-fresh-header edge itself is NOT
-  machine-verified. Its correctness rests on the header's ABA-freedom:
-  versions only grow, and the only version-silent header write (D8's AND)
-  cannot recreate a prior bit pattern without intervening bumps. Modeling it
-  (new PCs I7/I8 + anchor/`allPCs`/space-table growth + full re-verification)
-  is a candidate next work item.
+- **Insert's keep-slot finalize retry**: on CAS failure, Go keeps the
+  `Trying` reservation and rescans under a fresh header. It releases the slot
+  if the key now exists or another claim holds the hash; otherwise it retries
+  the CAS against that header. The spec models unreserve-and-restart (I6 →
+  I1), so this Go retry path is not machine-verified. It requires the rescan
+  and CAS to use the same header, including its version and bin state.
+  Modeling it and re-verifying its refinement remains future work; the
+  version-wraparound limit below also applies. LoadOrCompute's publish does
+  match the model: on failure it unreserves and restarts (LC5 → LC8 → LC1).
 - **Entry pointer identity assumes GC no-reuse**: `slotTag`/`nextTag` model each
   entry pointer as never reused — sound for Go (a parked op's captured `*Entry`
   keeps the object reachable, so the allocator can't recycle it while a DWCAS

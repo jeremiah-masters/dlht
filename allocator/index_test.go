@@ -247,3 +247,83 @@ func TestFallbackAllocation(t *testing.T) {
 		})
 	}
 }
+
+func TestChooseInsertSlotFirstFree(t *testing.T) {
+	m, idx, pb := reservationTestBin(t, 3)
+	links := pb.LinkMeta
+	allocated := idx.linkNext
+	for occupied := uint8(SlotTrying); occupied <= SlotValid; occupied++ {
+		for first := 0; first <= MAX_SLOTS_PER_BIN; first++ {
+			var h Header
+			for i := range first {
+				h = h.setSlotStateAndVersion(i, occupied)
+			}
+			pb.Header = h
+			want := first
+			if first == MAX_SLOTS_PER_BIN {
+				want = -1
+			}
+			if got := m.chooseInsertSlot(idx, pb); got != want {
+				t.Fatalf("occupied=%d first=%d: got slot %d, want %d", occupied, first, got, want)
+			}
+			if pb.Header != h || pb.LinkMeta != links || idx.linkNext != allocated {
+				t.Fatalf("occupied=%d first=%d: selection changed the bin or allocated a link", occupied, first)
+			}
+		}
+	}
+}
+
+func TestChooseInsertSlotLinks(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		links     int
+		occupied  int
+		capacity  uint32
+		wantSlot  int
+		wantLinks int
+	}{
+		{"primary_without_capacity", 0, 0, 0, 0, 0},
+		{"attach_single", 0, 3, 1, 3, 1},
+		{"single_exhausted", 0, 3, 0, -1, 0},
+		{"existing_single", 1, 3, 1, 3, 1},
+		{"attach_pair", 1, 7, 3, 7, 3},
+		{"pair_exhausted", 1, 7, 1, -1, 1},
+		{"pair_needs_two_links", 1, 7, 2, -1, 1},
+		{"existing_pair", 3, 7, 3, 7, 3},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			m, idx, pb := reservationTestBin(t, tt.links)
+			idx.linkCapacity = tt.capacity
+			for i := range tt.occupied {
+				pb.Header = pb.Header.setSlotStateAndVersion(i, SlotValid)
+			}
+			h := pb.Header
+			if got := m.chooseInsertSlot(idx, pb); got != tt.wantSlot {
+				t.Fatalf("got slot %d, want %d", got, tt.wantSlot)
+			}
+			if got := pb.LinkMeta.getAttachedLinkCount(); got != tt.wantLinks {
+				t.Fatalf("attached links: got %d, want %d", got, tt.wantLinks)
+			}
+			if pb.Header != h {
+				t.Fatal("selection changed the header")
+			}
+			if tt.wantSlot >= 0 && idx.getSlotByIndex(pb, tt.wantSlot) == nil {
+				t.Fatal("selected slot has no backing bucket")
+			}
+		})
+	}
+}
+
+func reservationTestBin(t *testing.T, links int) (*Map[uint64, uint64], *index[uint64, uint64], *PrimaryBucket[uint64, uint64]) {
+	t.Helper()
+	m := New[uint64, uint64](Options{InitialSize: 32})
+	idx := m.getActiveIndex()
+	pb := idx.getBinByIndex(0)
+	if links >= 1 && idx.attachSingle(pb) == NO_LINK {
+		t.Fatal("could not attach single link")
+	}
+	if links == 3 && idx.attachPair(pb) == NO_LINK {
+		t.Fatal("could not attach link pair")
+	}
+	return m, idx, pb
+}

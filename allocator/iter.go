@@ -52,14 +52,15 @@ retry:
 		return m.scanShards(idx, binIdx, buf, yield)
 	}
 
-	vmPrim := h0.validMask3()
-	vmS := h0.validMask4(PRIMARY_SLOTS)
-	vmP0 := h0.validMask4(PRIMARY_SLOTS + LINK_SLOTS)
-	vmP1 := h0.validMask4(PRIMARY_SLOTS + 2*LINK_SLOTS)
-
-	if (vmPrim | vmS | vmP0 | vmP1) == 0 {
+	// Test both state bits once for the whole bin, then slice out each bucket.
+	vm := h0.validMaskAll()
+	if vm == 0 {
 		return true
 	}
+	vmPrim := vm & 0x15
+	vmS := (vm >> (2 * PRIMARY_SLOTS)) & 0x55
+	vmP0 := (vm >> (2 * (PRIMARY_SLOTS + LINK_SLOTS))) & 0x55
+	vmP1 := (vm >> (2 * (PRIMARY_SLOTS + 2*LINK_SLOTS))) & 0x55
 
 	count := readPrimarySlots(pb, vmPrim, buf)
 
