@@ -976,9 +976,10 @@ func TestLoadOrCompute_StressWithResizes(t *testing.T) {
 	}
 }
 
-// After a failed publish CAS, LoadOrCompute must rescan for both entries and
-// claims. Race two computes with an Insert under header churn, then check
-// that one writer won, all callers agree, and no computed value was discarded.
+// After a failed publish CAS, LoadOrCompute releases its slot and must rescan
+// for both entries and claims. Race two computes with an Insert under header
+// churn, then check that one writer won, all callers agree, and no computed
+// value was discarded.
 func TestLoadOrCompute_PublishRetryMeetsInsertOrClaim(t *testing.T) {
 	m := newWithSeed[uint64, uint64](Options{InitialSize: 16}, testSeed)
 	keys := keysForBin(testSeed, 15, 0, 2, 1<<22)
@@ -1054,6 +1055,13 @@ func TestLoadOrCompute_PublishRetryMeetsInsertOrClaim(t *testing.T) {
 		}
 		if _, ok := m.Delete(k); !ok {
 			t.Fatalf("round %d: reset Delete failed", r)
+		}
+		// Both keys are gone, so a slot left behind is a leaked reservation.
+		h := atomicLoadHeader(&m.getActiveIndex().getBin(hash).Header)
+		for i := range MAX_SLOTS_PER_BIN {
+			if st := h.getSlotState(i); st != SlotInvalid {
+				t.Fatalf("round %d: slot %d left in state %d, want every slot Invalid", r, i, st)
+			}
 		}
 	}
 }

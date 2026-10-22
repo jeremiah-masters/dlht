@@ -268,7 +268,7 @@ stateDiagram-v2
 
 **Trying → Invalid**: If an insert needs to abort (found a duplicate key, resize started), it can unreserve the slot. This only succeeds if the bin is still in normal operation—once transfer starts, the slot belongs to the transfer process.
 
-**Trying → Shadow**: LoadOrCompute publishes its claim after writing the hash. The entry pointer remains nil. The CAS uses the post-reserve header, or the header used for the latest retry scan. Insert and LoadOrCompute wait for claims with the same hash; readers ignore them. The value function runs while the slot is Shadow.
+**Trying → Shadow**: LoadOrCompute publishes its claim after writing the hash. The entry pointer remains nil. The CAS uses the post-reserve header; if it fails, LoadOrCompute releases the slot and starts over. Insert and LoadOrCompute wait for claims with the same hash; readers ignore them. The value function runs while the slot is Shadow.
 
 **Shadow → Valid**: The holder release-stores the computed entry, then commits with a CAS from Shadow to Valid. The entry becomes visible at this CAS. Before it, readers exclude Shadow slots and no DWCAS can match the fresh entry pointer.
 
@@ -698,11 +698,11 @@ The AND doesn't bump the version, but correctness doesn't require it to: the *bi
 
 `LoadOrCompute(key, fn)` returns an existing value without calling `fn`. Otherwise it claims the key, calls `fn` once, and inserts the result if `save=true`. Callbacks for the same key cannot overlap, and a computed value cannot lose an insertion race. An overlapping Put or Delete can still replace or remove the value after it is inserted.
 
-Claims use the **Shadow (0b10)** slot state. `spec/protocol.qnt` models the protocol in LC1–LC10, with `contractAtMostOneComputePerKey` and `contractHolderExclusive` expressing the callback guarantees. The model's scope and differences from Go, including the retry paths, are documented in `spec/README.md`.
+Claims use the **Shadow (0b10)** slot state. `spec/protocol.qnt` models the protocol in LC1–LC10, with `contractAtMostOneComputePerKey` and `contractHolderExclusive` expressing the callback guarantees. The model's scope and differences from Go, including Insert's finalize retry, are documented in `spec/README.md`.
 
 1. **Scan** under the seqlock header. Return a matching entry, or wait and rescan if a Shadow slot holds the hash.
 2. **Reserve** an Invalid slot as Trying and write the hash.
-3. **Publish** Trying→Shadow with a CAS against the post-reserve header. If it fails, keep the reservation and rescan under a fresh header before retrying. Release the reservation if the key now exists or another claim holds the hash. The entry pointer remains nil while `fn` runs.
+3. **Publish** Trying→Shadow with a CAS against the post-reserve header. If it fails, release the reservation and restart from the scan, as the model does (LC5 → LC8 → LC1). The entry pointer remains nil while `fn` runs.
 4. **Run `fn`** once under the claim.
 5. **Resolve** by release-storing the computed entry and CASing Shadow→Valid for `save=true`, or CASing Shadow→Invalid for `save=false`.
 

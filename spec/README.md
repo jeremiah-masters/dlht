@@ -175,15 +175,15 @@ stage-1a evidence tier is described below.
   theorem (`rsDone` is an abstract no-op). The Phase 0 inductive +
   anchored-refinement results continue to hold on the maxGen=0 configs
   (re-verified; `rsInvPure` additions are inert there by `genTopology`).
-- **The keep-slot retry paths (Insert finalize, LoadOrCompute publish)**: on
-  CAS failure, Go keeps the `Trying` reservation and rescans under a fresh
-  header. It releases the slot if the key now exists or another claim holds
-  the hash; otherwise it retries the CAS against that header. The spec models
-  unreserve-and-restart (I6 → I1 and LC8 → LC1), so these Go retry paths are
-  not machine-verified. They require the rescan and CAS to use the same
-  header, including its version and bin state. Modeling the retry paths and
-  re-verifying their refinement remains future work; the version-wraparound
-  limit below also applies.
+- **Insert's keep-slot finalize retry**: on CAS failure, Go keeps the
+  `Trying` reservation and rescans under a fresh header. It releases the slot
+  if the key now exists or another claim holds the hash; otherwise it retries
+  the CAS against that header. The spec models unreserve-and-restart (I6 →
+  I1), so this Go retry path is not machine-verified. It requires the rescan
+  and CAS to use the same header, including its version and bin state.
+  Modeling it and re-verifying its refinement remains future work; the
+  version-wraparound limit below also applies. LoadOrCompute's publish does
+  match the model: on failure it unreserves and restarts (LC5 → LC8 → LC1).
 - **Entry pointer identity assumes GC no-reuse**: `slotTag`/`nextTag` model each
   entry pointer as never reused — sound for Go (a parked op's captured `*Entry`
   keeps the object reachable, so the allocator can't recycle it while a DWCAS

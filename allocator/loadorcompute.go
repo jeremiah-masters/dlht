@@ -119,64 +119,9 @@ retry:
 		return m.computeAndResolve(idx, pb, slot, slotIndex, hash, key, fn)
 	}
 
-	// Keep the reservation on a failed publish, but rescan before retrying.
-retryWithSlot:
-	h2 := atomicLoadHeader(&pb.Header)
-
-	if h2.getBinState() != BinNoTransfer {
-		if h2.getBinState() == BinDoneTransfer {
-			idx = idx.getNextIndex()
-			goto retry
-		}
-		cpu.Yield()
-		if atomicLoadHeader(&pb.Header).getBinState() == BinInTransfer {
-			runtime.Gosched()
-		}
-		idx = m.getActiveIndex()
-		goto retry
-	}
-
-	// Check if key now exists in primary bucket
-	bitmap2 := m.matchPrimaryBucketKeys(pb, h2.validMask3(), hash)
-
-	for bitmap2 != 0 {
-		slotIdx := bits.TrailingZeros32(bitmap2) >> 1
-		candidate := atomicLoadSlotVal(pb.slotAt(slotIdx))
-		if candidate != nil && candidate.Key == key {
-			// Key was inserted by another thread, unreserve our slot and return existing value
-			if h3 := atomicLoadHeader(&pb.Header); h2 == h3 {
-				m.unreserveSlot(pb, nil, slotIndex)
-				return candidate.Value, true
-			}
-			goto retryWithSlot
-		}
-		bitmap2 &= bitmap2 - 1
-	}
-
-	// Check if key exists in link buckets
-	if entry := m.scanLinksForKey(idx, pb, h2, key, hash); entry != nil {
-		if h3 := atomicLoadHeader(&pb.Header); h2 == h3 {
-			m.unreserveSlot(pb, nil, slotIndex)
-			return entry.Value, true
-		}
-		goto retryWithSlot
-	}
-
-	// A claim may have appeared since we reserved. Do not publish past it.
-	if h2.shadowMaskAll() != 0 {
-		if si, _ := m.findShadowSlot(idx, pb, h2, hash); si >= 0 {
-			m.unreserveSlot(pb, nil, slotIndex)
-			goto retry
-		}
-	}
-
-	// Key doesn't exist and nobody claims it, try to publish our reserved slot again
-	if m.publishClaim(pb, h2, slotIndex) {
-		return m.computeAndResolve(idx, pb, slot, slotIndex, hash, key, fn)
-	}
-
-	// Still failing, retry the check
-	goto retryWithSlot
+	// The bin changed after we reserved. Release the slot and start over.
+	m.unreserveSlot(pb, nil, slotIndex)
+	goto retry
 }
 
 func (m *Map[K, V]) publishClaim(pb *PrimaryBucket[K, V], oldH Header, i int) bool {
