@@ -25,6 +25,17 @@ func execOp[K dlht.Key, V any](m *dlht.Map[K, V], op Op[K, V]) OpResult[V] {
 	case OpDelete:
 		deleted, ok := m.Delete(op.Key)
 		return OpResult[V]{Found: ok, Value: deleted}
+	case OpLoadOrCompute, OpLoadOrComputeNoSave:
+		save := op.Kind == OpLoadOrCompute
+		calls := 0
+		val, loaded := m.LoadOrCompute(op.Key, func() (V, bool) {
+			calls++
+			return op.Value, save
+		})
+		if calls > 1 {
+			panic(fmt.Sprintf("LoadOrCompute called fn %d times", calls))
+		}
+		return OpResult[V]{Found: loaded, Value: val, Computed: calls == 1}
 	default:
 		panic(fmt.Sprintf("unknown op kind: %d", op.Kind))
 	}
@@ -90,8 +101,12 @@ func filterTimedOpsByKey[K comparable, V any](ops []TimedOp[K, V], key K) []Time
 }
 
 func runPerKeyLinearizabilityCase[K dlht.Key](t *rapid.T, initialSize uint64, threads int, opsPerThread int, keyGen *rapid.Generator[K]) {
+	runPerKeyLinearizabilityCaseMix(t, initialSize, threads, opsPerThread, keyGen, MixChurn)
+}
+
+func runPerKeyLinearizabilityCaseMix[K dlht.Key](t *rapid.T, initialSize uint64, threads int, opsPerThread int, keyGen *rapid.Generator[K], mix OpMix) {
 	valGen := rapid.IntRange(-1000, 1000)
-	opsGen := GenOpSequence(keyGen, valGen, MixChurn, opsPerThread, opsPerThread)
+	opsGen := GenOpSequence(keyGen, valGen, mix, opsPerThread, opsPerThread)
 	opsByThread := drawOpsByThread(t, threads, opsGen, "ops")
 
 	m := dlht.New[K, int](dlht.Options{InitialSize: initialSize})

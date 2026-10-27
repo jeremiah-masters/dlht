@@ -165,6 +165,20 @@ func (m *Map[K, V]) transferBin(ctx *resizeContext[K, V], binIndex uint64) {
 		m.transferValidSlots(ctx, h.validMask4(PRIMARY_SLOTS+2*LINK_SLOTS), ctx.oldIndex.getLinkBucket(p+1).slotAt(0), sentinel)
 	}
 
+	// Carry claims by hash. The holder keeps the value and resolves the claim
+	// after transfer. Shadow slots need no sentinel: Put/Delete cannot target
+	// them, and the holder's CAS cannot succeed while the bin is transferring.
+	if h.shadowMaskAll() != 0 {
+		m.carryShadowSlots(ctx, h.shadowMask3(), oldBin.slotAt(0))
+		if s := lm.getSingle(); s != NO_LINK {
+			m.carryShadowSlots(ctx, h.shadowMask4(PRIMARY_SLOTS), ctx.oldIndex.getLinkBucket(s).slotAt(0))
+		}
+		if p := lm.getPairStart(); p != NO_LINK {
+			m.carryShadowSlots(ctx, h.shadowMask4(PRIMARY_SLOTS+LINK_SLOTS), ctx.oldIndex.getLinkBucket(p).slotAt(0))
+			m.carryShadowSlots(ctx, h.shadowMask4(PRIMARY_SLOTS+2*LINK_SLOTS), ctx.oldIndex.getLinkBucket(p+1).slotAt(0))
+		}
+	}
+
 	// Mark bin as complete
 	finalHeader := h.setBinState(BinDoneTransfer)
 	atomic.StoreUint64((*uint64)(&oldBin.Header), uint64(finalHeader))
@@ -190,6 +204,38 @@ func (m *Map[K, V]) transferValidSlots(ctx *resizeContext[K, V], vm uint32, base
 
 		vm &= vm - 1
 	}
+}
+
+// carryShadowSlots copies the snapshot's claims into the new index.
+// sm is a spread bitmask; baseSlot points to slot 0 of the bucket.
+func (m *Map[K, V]) carryShadowSlots(ctx *resizeContext[K, V], sm uint32, baseSlot *Slot[K, V]) {
+	for sm != 0 {
+		slotIdx := bits.TrailingZeros32(sm) >> 1
+		slot := (*Slot[K, V])(unsafe.Add(unsafe.Pointer(baseSlot), uintptr(slotIdx)*unsafe.Sizeof(*baseSlot)))
+
+		// The claim's hash was published before transfer and stays fixed
+		// until the bin is done.
+		m.claimIntoNewIndex(ctx, ctx.newIndex, slot.Key)
+
+		sm &= sm - 1
+	}
+}
+
+// claimIntoNewIndex installs a claim with no entry. As in insertIntoNewIndex,
+// the old bin's DoneTransfer store publishes these plain writes.
+func (m *Map[K, V]) claimIntoNewIndex(ctx *resizeContext[K, V], idx *index[K, V], hash uint64) {
+	pb := idx.getBin(hash)
+
+	// Claims use the same resize capacity budget as valid entries.
+	slotIndex := ctx.findFreeSlotOrChain(pb)
+	if slotIndex < 0 {
+		panic("dlht: resize found no free child slot for a carried claim")
+	}
+	slot := idx.getSlotByIndex(pb, slotIndex)
+
+	slot.Key = hash
+
+	pb.Header = pb.Header.setSlotStateAndVersion(slotIndex, SlotShadow)
 }
 
 func (m *Map[K, V]) insertIntoNewIndex(ctx *resizeContext[K, V], idx *index[K, V], hash uint64, entry *Entry[K, V]) {

@@ -95,49 +95,30 @@ func (idx *index[K, V]) getSlotByIndex(pb *PrimaryBucket[K, V], slotIndex int) *
 // in priority order: primary -> single-link -> pair0 -> pair1.
 func (m *Map[K, V]) chooseInsertSlot(idx *index[K, V], pb *PrimaryBucket[K, V]) int {
 	h := atomicLoadHeader(&pb.Header)
-
-	// Check primary bucket first (hot path)
-	primaryMask := h.invalidMask3()
-	if primaryMask != 0 {
-		return bits.TrailingZeros32(primaryMask) >> 1
+	s := uint32(h)
+	invalid := ^(s | s>>1) & 0x15555555
+	if invalid == 0 {
+		return -1
+	}
+	i := bits.TrailingZeros32(invalid) >> 1
+	if i < PRIMARY_SLOTS {
+		return i
 	}
 
+	// Unattached links have only Invalid slots, so their first slot is chosen.
 	lm := atomicLoadLinkMeta(&pb.LinkMeta)
-
-	// Primary full, check link buckets (cold path)
-	hasSingle := lm.getSingle() != NO_LINK
-	hasPair := lm.getPairStart() != NO_LINK
-
-	// Check single link bucket if it exists
-	if hasSingle {
-		singleMask := h.invalidMask4(PRIMARY_SLOTS)
-		if singleMask != 0 {
-			return PRIMARY_SLOTS + bits.TrailingZeros32(singleMask)>>1
+	if i < PRIMARY_SLOTS+LINK_SLOTS {
+		if lm.getSingle() != NO_LINK {
+			return i
 		}
-	}
-
-	// Check pair link buckets if they exist
-	if hasPair {
-		pair0Mask := h.invalidMask4(PRIMARY_SLOTS + LINK_SLOTS)
-		if pair0Mask != 0 {
-			return PRIMARY_SLOTS + LINK_SLOTS + bits.TrailingZeros32(pair0Mask)>>1
-		}
-
-		pair1Mask := h.invalidMask4(PRIMARY_SLOTS + 2*LINK_SLOTS)
-		if pair1Mask != 0 {
-			return PRIMARY_SLOTS + 2*LINK_SLOTS + bits.TrailingZeros32(pair1Mask)>>1
-		}
-	}
-
-	// No free slots, try to attach next link bucket
-	if !hasSingle {
 		if idx.attachSingle(pb) != NO_LINK {
-			// Successfully attached single, the first slot in this link is free
 			return PRIMARY_SLOTS
 		}
-	} else if !hasPair {
+	} else {
+		if lm.getPairStart() != NO_LINK {
+			return i
+		}
 		if idx.attachPair(pb) != NO_LINK {
-			// Successfully attached pair, the first slot in link 1 is free
 			return PRIMARY_SLOTS + LINK_SLOTS
 		}
 	}

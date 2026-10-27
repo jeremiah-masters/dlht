@@ -43,7 +43,7 @@ retry:
 	var found bool
 
 	// Generate bitmap representing (<valid slots> & <matching hash>)
-	bitmap := m.matchPrimaryBucketKeys(pb, h0, hash)
+	bitmap := m.matchPrimaryBucketKeys(pb, h0.validMask3(), hash)
 
 	// Bitmap encodes matching slots with bit_{i*2} matching slot_i
 	for bitmap != 0 {
@@ -127,8 +127,10 @@ retry:
 // loop or version bump. This is safe because:
 //   - The bit change itself makes h1 ≠ h0 for seqlock readers (Get/Put/Delete).
 //   - ABA is impossible: any Insert re-filling this slot bumps the header version.
-//   - No safety checks are needed: the slot must be Valid (DWCAS just succeeded),
-//     entry must be nil (DWCAS cleared it), and resize reads entry values not slot states.
+//   - No safety checks are needed: the slot must be Valid (DWCAS just succeeded)
+//     and entry must be nil (DWCAS cleared it). The slot cannot be reused
+//     until this AND clears it, so it cannot clear a Shadow claim. Resize
+//     uses its saved header snapshot, which this AND cannot change.
 func (m *Map[K, V]) markSlotInvalid(pb *PrimaryBucket[K, V], slotIdx int) {
 	mask := ^(uint64(0x3) << (uint(slotIdx*2) & 63))
 	atomicAndHeader(&pb.Header, mask)

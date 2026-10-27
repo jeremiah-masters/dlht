@@ -10,6 +10,11 @@ import (
 
 // Insert inserts (key, value) into the map. If the key already exists, it returns the existing value and false.
 // Returns (previousValue, success) where success indicates if the insertion succeeded.
+//
+// If a LoadOrCompute of the same key (or of a key with the same 64-bit hash)
+// is running its value function, Insert waits for it to finish, then either
+// returns the computed value or inserts. Calling Insert for the key from
+// inside that value function therefore never returns.
 func (m *Map[K, V]) Insert(key K, value V) (V, bool) {
 	hash := maphash.Comparable(m.hashConfig.Seed, key)
 	idx := m.getActiveIndex()
@@ -34,7 +39,7 @@ retry:
 	}
 
 	// Step 2: Run the Get algorithm - check if key already exists
-	bitmap := m.matchPrimaryBucketKeys(pb, h0, hash)
+	bitmap := m.matchPrimaryBucketKeys(pb, h0.validMask3(), hash)
 
 	// Check all hash matches in the primary bucket
 	for bitmap != 0 {
@@ -57,6 +62,14 @@ retry:
 		goto retry
 	}
 
+	// Wait for a pending compute with the same hash before reserving a slot.
+	if h0.shadowMaskAll() != 0 {
+		if si, _ := m.findShadowSlot(idx, pb, h0, hash); si >= 0 {
+			m.waitForClaim(pb, si)
+			goto retry
+		}
+	}
+
 	// Step 3: Find the first slot that is in Invalid state.
 	// Fast path: derive free primary slot from h0 without reloading the header.
 	// The reserve CAS compares against h0, so any staleness causes CAS failure and retry.
@@ -74,7 +87,7 @@ retry:
 		goto retry
 	}
 
-	// Step 4: Reserve the slot (transition Invalid to TryInsert)
+	// Step 4: Reserve the slot (transition Invalid to Trying)
 	h1 := h0.setSlotStateAndVersion(slotIndex, SlotTrying)
 	if !m.reserveSlot(pb, h0, h1) {
 		goto retry
@@ -82,16 +95,11 @@ retry:
 
 	// Step 4.1: Fill the slot
 	slot := idx.getSlotByIndex(pb, slotIndex)
-	if slot == nil {
-		m.unreserveSlot(idx, pb, slotIndex)
-		goto retry
-	}
-
 	slot.Key = hash
 	entry := &Entry[K, V]{Key: key, Value: value}
 	atomicStoreSlotVal(slot, entry) // We must release-store the entry to synchronize with any concurrent reads
 
-	// Step 5: Transition slot TryInsert to Valid
+	// Step 5: Transition slot Trying to Valid
 	if m.finalizeSlot(pb, h1, slotIndex) {
 		var zero V
 		return zero, true
@@ -104,7 +112,6 @@ retryWithSlot:
 
 	if h2.getBinState() != BinNoTransfer {
 		if h2.getBinState() == BinDoneTransfer {
-			m.unreserveSlot(idx, pb, slotIndex)
 			idx = idx.getNextIndex()
 			goto retry
 		}
@@ -112,13 +119,12 @@ retryWithSlot:
 		if atomicLoadHeader(&pb.Header).getBinState() == BinInTransfer {
 			runtime.Gosched()
 		}
-		m.unreserveSlot(idx, pb, slotIndex)
 		idx = m.getActiveIndex()
 		goto retry
 	}
 
 	// Check if key now exists in primary bucket
-	bitmap2 := m.matchPrimaryBucketKeys(pb, h2, hash)
+	bitmap2 := m.matchPrimaryBucketKeys(pb, h2.validMask3(), hash)
 
 	for bitmap2 != 0 {
 		slotIdx := bits.TrailingZeros32(bitmap2) >> 1
@@ -126,7 +132,7 @@ retryWithSlot:
 		if candidate != nil && candidate.Key == key {
 			// Key was inserted by another thread, unreserve our slot and return existing value
 			if h3 := atomicLoadHeader(&pb.Header); h2 == h3 {
-				m.unreserveSlot(idx, pb, slotIndex)
+				m.unreserveSlot(pb, slot, slotIndex)
 				return candidate.Value, false
 			}
 			goto retryWithSlot
@@ -137,10 +143,19 @@ retryWithSlot:
 	// Check if key exists in link buckets
 	if entry := m.scanLinksForKey(idx, pb, h2, key, hash); entry != nil {
 		if h3 := atomicLoadHeader(&pb.Header); h2 == h3 {
-			m.unreserveSlot(idx, pb, slotIndex)
+			m.unreserveSlot(pb, slot, slotIndex)
 			return entry.Value, false
 		}
 		goto retryWithSlot
+	}
+
+	// A claim may have appeared since we reserved. Finalizing past it would
+	// duplicate the key when the compute commits.
+	if h2.shadowMaskAll() != 0 {
+		if si, _ := m.findShadowSlot(idx, pb, h2, hash); si >= 0 {
+			m.unreserveSlot(pb, slot, slotIndex)
+			goto retry
+		}
 	}
 
 	// Key doesn't exist yet, try to finalize our reserved slot again
@@ -162,22 +177,21 @@ func (m *Map[K, V]) finalizeSlot(pb *PrimaryBucket[K, V], oldH Header, i int) bo
 	return atomicCASHeader(&pb.Header, oldH, newH)
 }
 
-func (m *Map[K, V]) unreserveSlot(idx *index[K, V], pb *PrimaryBucket[K, V], i int) bool {
-	// Unreserve should retry on CAS failures, but must preserve prior updates to the header
+// unreserveSlot releases an owned Trying slot. Pass nil if no entry was stored.
+func (m *Map[K, V]) unreserveSlot(pb *PrimaryBucket[K, V], slot *Slot[K, V], i int) {
 	for {
 		h := atomicLoadHeader(&pb.Header)
-		if h.getSlotState(i) != SlotTrying || h.getBinState() != BinNoTransfer {
-			return false
+		if h.getBinState() != BinNoTransfer {
+			return
 		}
-
-		// We still exclusively own SlotTrying; clear the value before releasing the slot
-		if slot := idx.getSlotByIndex(pb, i); slot != nil {
+		if slot != nil {
 			slot.Val = nil
+			slot = nil
 		}
 
 		newH := h.setSlotStateAndVersion(i, SlotInvalid)
 		if atomicCASHeader(&pb.Header, h, newH) {
-			return true
+			return
 		}
 	}
 }

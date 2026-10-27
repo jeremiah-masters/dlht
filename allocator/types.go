@@ -13,10 +13,13 @@ const (
 	BinDoneTransfer = 2
 )
 
+// Slot states occupy two bits. Valid requires both bits, so scans exclude
+// pending LoadOrCompute claims (Shadow) even after their entry is stored.
 const (
-	SlotInvalid = 0
-	SlotTrying  = 1
-	SlotValid   = 2
+	SlotInvalid = 0 // empty
+	SlotTrying  = 1 // reserved, not yet published
+	SlotShadow  = 2 // compute claim; blocks same-hash Insert and LoadOrCompute
+	SlotValid   = 3 // published entry
 )
 
 const (
